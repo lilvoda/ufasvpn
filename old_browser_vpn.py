@@ -2051,6 +2051,7 @@ class VpnCoordinator:
         self._ovpn_proc = None
         self.ovpn_disable_dco = False
         self.ovpn_ignore_dns_block = False
+        self.ovpn_failed = False
         if self.ovpn_dir:
             d_abs = os.path.abspath(self.ovpn_dir)
             if not os.path.isdir(d_abs):
@@ -2117,6 +2118,8 @@ class VpnCoordinator:
         else:
             cfg = self.ovpn_files[self.ovpn_idx % len(self.ovpn_files)]
             self.ovpn_idx += 1
+        if not os.path.isfile(cfg):
+            return False, f"Config hilang: {os.path.basename(cfg)}"
         cmd = [self.ovpn_bin, '--config', cfg, '--auth-nocache']
         if os.name != 'nt':
             cmd.extend(['--ignore-unknown-option', 'block-outside-dns'])
@@ -2389,21 +2392,37 @@ class VpnCoordinator:
             try:
                 if self.ovpn_files:
                     cmd_ok = False
-                    for _ov_try in range(min(4, len(self.ovpn_files))):
+                    last_ov_err = ''
+                    for _ov_try in range(len(self.ovpn_files)):
+                        nxt_idx = (self.ovpn_idx % len(self.ovpn_files)) + 1
+                        nxt_name = os.path.basename(self.ovpn_files[nxt_idx - 1])
                         if not _TUI_ACTIVE:
-                            p_out(f"\n{c(GOLD)}[*] VPN {trigger}: rotasi OpenVPN config #{(self.ovpn_idx % len(self.ovpn_files)) + 1}/{len(self.ovpn_files)}...{W}")
+                            p_out(f"\n{c(GOLD)}[*] VPN {trigger}: rotasi OpenVPN #{nxt_idx}/{len(self.ovpn_files)} ({nxt_name})...{W}")
+                        else:
+                            _LIVE_LOGS.append(f" {c(GOLD)}!{W}  {c(GOLD)}OVPN #{nxt_idx}: {nxt_name[:26]}{W}")
+                            render_dashboard(force=True)
                         ok_s, info_s = await self.start_ovpn()
                         if not ok_s:
+                            last_ov_err = info_s
                             if not _TUI_ACTIVE:
                                 p_out(f"{c(RED)}[!] OpenVPN rotasi gagal: {info_s}{W}")
+                            else:
+                                _LIVE_LOGS.append(f" {c(RED)}!{W}  {c(RED)}OVPN err: {info_s[:28]}{W}")
                             continue
                         ok_mt, mt_reason, _ = await _probe_direct_moonton_ms(timeout_s=6.0)
                         if ok_mt:
                             cmd_ok = True
                             break
+                        last_ov_err = mt_reason
                         if not _TUI_ACTIVE:
                             p_out(f"{c(GOLD)}[!] OpenVPN {info_s} gagal ke API Moonton ({mt_reason}), ganti config berikutnya...{W}")
+                        else:
+                            _LIVE_LOGS.append(f" {c(GOLD)}!{W}  {c(GOLD)}OVPN drop: {mt_reason[:24]}{W}")
                         await self.stop_ovpn()
+                    if not cmd_ok:
+                        self.ovpn_failed = True
+                        self.epoch += 1
+                        raise RuntimeError(f"Semua OpenVPN gagal rotasi ({last_ov_err[:50]}) - dihentikan agar IP asli tidak bocor")
                     if self.ip_check:
                         new_ip = await fetch_public_ip(timeout_s=3.0)
                         if new_ip != 'unknown':
@@ -3879,6 +3898,8 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                         break
 
                     # Do NOT burn account retries if another tab rotated/refreshed context OR VPN rotation is active/completed mid-flight
+                    if vpn_coord and vpn_coord.ovpn_failed:
+                        raise RuntimeError("OpenVPN rotation failed - stopping worker to protect IP")
                     if my_gen != ctx_gen or (vpn_coord and (vpn_coord.rotating or vpn_coord.epoch != seen_vpn_ep)):
                         if vpn_coord and not vpn_coord.gate.is_set():
                             try:
@@ -4421,7 +4442,7 @@ async def async_main():
         async def worker_with_restart(wid: int, p_info, wave_limit: int = 0, wave_idx: int = 0):
             MAX_CONSECUTIVE_FAILS = 10
             fail_count = 0
-            while (combo_q.pending > 0) and not (wave_limit and stats['checked'] >= wave_limit):
+            while (combo_q.pending > 0) and not (wave_limit and stats['checked'] >= wave_limit) and not (vpn_coord and vpn_coord.ovpn_failed):
                 started_at = time.time()
                 try:
                     cur_b = await ensure_browser(force_relaunch=(fail_count >= 6 and browser_state['active'] == 0))
@@ -4431,7 +4452,7 @@ async def async_main():
                         acct_retries=acct_retries, wave_limit=wave_limit, wave_idx=wave_idx,
                         vpn_coord=vpn_coord,
                     )
-                    if combo_q.pending <= 0 or (wave_limit and stats['checked'] >= wave_limit):
+                    if combo_q.pending <= 0 or (wave_limit and stats['checked'] >= wave_limit) or (vpn_coord and vpn_coord.ovpn_failed):
                         break  # selesai wave / semua item selesai
                     while combo_q.empty() and combo_q.pending > 0 and not (wave_limit and stats['checked'] >= wave_limit):
                         await asyncio.sleep(0.5)
@@ -4451,6 +4472,8 @@ async def async_main():
                             print_result('ERR', f"worker-{wid}", "sys", f"stopped:{str(e)[:15]}")
                         break
                     if wave_limit and stats['checked'] >= wave_limit:
+                        break
+                    if vpn_coord and vpn_coord.ovpn_failed:
                         break
                     wait = min(2 ** min(fail_count, 4), 16)  # exponential backoff max 16s
                     if not _TUI_ACTIVE:
