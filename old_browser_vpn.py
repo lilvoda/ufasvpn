@@ -4312,7 +4312,6 @@ async def async_main():
     vpn_ip_check = not bool(args.no_vpn_ip_check)
     local_vpns_dir = os.path.join(BASE, 'vpns')
     ovpn_dir = (args.vpn_ovpn_dir or '').strip()
-    ovpn_country_filter = ''
     skip_ovpn_test = bool(args.skip_ovpn_test)
 
     def _count_ovpn(d: str) -> int:
@@ -4396,18 +4395,15 @@ async def async_main():
                 PROXY_FILE = os.path.abspath(args.proxy_file)
         if (not PROXY_ENABLED) and not vpn_cmd and not vpn_wait:
             if not ovpn_dir and avail_ovpn > 0:
-                print(f"  {c(GRAY)}Mode VPN: [1] OpenVPN Auto ({avail_ovpn} .ovpn)  [2] Manual VPN  [3] Direct{W}")
-                v_mode = ask("Pilih mode jaringan (1-3)", "1")
-                if v_mode == "1":
-                    ovpn_dir = local_vpns_dir
-                elif v_mode == "2":
+                print(f"  {c(GRAY)}Mode VPN: [1] OpenVPN Auto ({avail_ovpn} .ovpn)  [2] Manual VPN{W}")
+                v_mode = ask("Pilih mode jaringan (1-2)", "1")
+                if v_mode == "2":
                     vpn_wait = True
+                else:
+                    ovpn_dir = local_vpns_dir
             if ovpn_dir:
-                ovpn_country_filter = ask("Filter negara .ovpn (mis: sg,jp,us | Enter=semua)", "")
-                th_str = ask("Auto-rotasi OpenVPN setelah berapa WAF berturut-turut?", str(vpn_waf_threshold))
-                if th_str.isdigit() and int(th_str) >= 1:
-                    vpn_waf_threshold = int(th_str)
-                skip_ovpn_test = not ask_yn("Uji koneksi semua .ovpn ke API Moonton di awal?", default='n' if args.skip_ovpn_test else 'y')
+                vpn_waf_threshold = 5
+                skip_ovpn_test = False
             elif not vpn_wait:
                 vpn_wait = ask_yn("Pause tunggu ganti server VPN manual jika IP kena WAF?", default='n')
                 if not vpn_wait:
@@ -4441,12 +4437,6 @@ async def async_main():
             ip_check=vpn_ip_check, current_ip=vpn_ip_init,
             ovpn_dir=ovpn_dir, ovpn_auth=args.vpn_ovpn_auth,
         )
-        if vpn_coord and vpn_coord.ovpn_files and ovpn_country_filter.strip():
-            prefixes = tuple(p.strip().lower() for p in ovpn_country_filter.split(',') if p.strip())
-            filtered = [f for f in vpn_coord.ovpn_files if os.path.basename(f).lower().startswith(prefixes)]
-            if not filtered:
-                raise RuntimeError(f"Tidak ada file .ovpn yang cocok dengan filter '{ovpn_country_filter}'")
-            vpn_coord.ovpn_files = filtered
     except RuntimeError as ve:
         p_out(f"{c(RED)}[!] {ve}{W}")
         return
