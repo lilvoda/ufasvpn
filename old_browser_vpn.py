@@ -2159,6 +2159,24 @@ class VpnCoordinator:
         if had_force_kill:
             await self._cleanup_win_ovpn_state()
 
+    def _build_ovpn_cmd(self, cfg: str, mgmt_port: int = 0, is_win: bool | None = None) -> list[str]:
+        win = (os.name == 'nt') if is_win is None else bool(is_win)
+        # ponytail: --ignore-unknown-option must precede --config so Linux OpenVPN skips Windows block-outside-dns
+        cmd = [self.ovpn_bin or 'openvpn']
+        if not win:
+            cmd.extend(['--ignore-unknown-option', 'block-outside-dns', '--pull-filter', 'ignore', 'block-outside-dns'])
+        cmd.extend(['--config', cfg, '--auth-nocache'])
+        if mgmt_port:
+            cmd.extend(['--management', '127.0.0.1', str(mgmt_port)])
+        if win:
+            if self.ovpn_disable_dco:
+                cmd.append('--disable-dco')
+            if self.ovpn_ignore_dns_block:
+                cmd.extend(['--pull-filter', 'ignore', 'block-outside-dns'])
+        if self.ovpn_auth:
+            cmd.extend(['--auth-user-pass', os.path.abspath(self.ovpn_auth)])
+        return cmd
+
     async def start_ovpn(self, cfg_override: str = '', timeout_s: float = 22.0) -> tuple[bool, str]:
         global _ovpn_pid
         await self.stop_ovpn()
@@ -2179,18 +2197,7 @@ class VpnCoordinator:
                 mgmt_port = s.getsockname()[1]
         except Exception:
             mgmt_port = 0
-        cmd = [self.ovpn_bin, '--config', cfg, '--auth-nocache']
-        if mgmt_port:
-            cmd.extend(['--management', '127.0.0.1', str(mgmt_port)])
-        if os.name != 'nt':
-            cmd.extend(['--ignore-unknown-option', 'block-outside-dns'])
-        else:
-            if self.ovpn_disable_dco:
-                cmd.append('--disable-dco')
-            if self.ovpn_ignore_dns_block:
-                cmd.extend(['--pull-filter', 'ignore', 'block-outside-dns'])
-        if self.ovpn_auth:
-            cmd.extend(['--auth-user-pass', os.path.abspath(self.ovpn_auth)])
+        cmd = self._build_ovpn_cmd(cfg, mgmt_port)
         kw = {'stdout': asyncio.subprocess.PIPE, 'stderr': asyncio.subprocess.STDOUT}
         if os.name != 'nt':
             kw['start_new_session'] = True
@@ -2216,7 +2223,10 @@ class VpnCoordinator:
                 continue
             ln = raw_ln.decode('utf-8', errors='ignore').strip()
             if ln:
-                last_line = ln
+                if 'use --help' in ln.lower() and prev_line:
+                    last_line = f"{prev_line} | {ln}"
+                else:
+                    last_line = ln
                 dbg(f"ovpn[{os.path.basename(cfg)}]: {ln[:90]}")
             low = ln.lower()
             if 'initialization sequence completed' in low:
@@ -2228,7 +2238,8 @@ class VpnCoordinator:
             )):
                 last_line = prev_line + " | " + ln if ('netsh:' in prev_line.lower() and prev_line) else ln
                 break
-            prev_line = ln
+            if ln:
+                prev_line = ln
         if not ok:
             await self.stop_ovpn()
             if time.monotonic() >= deadline:
@@ -4257,6 +4268,8 @@ async def async_main():
         assert plat['tag'] in ('Windows', 'Termux-Native', 'Termux-Proot', 'Linux')
         vc = VpnCoordinator(waf_threshold=2, waf_cooldown=3.0, ip_check=False)
         assert vc.consec_waf_rate == 0 and vc.label() == 'VPN · Direct' and not vc.ovpn_started
+        linux_cmd = vc._build_ovpn_cmd('/tmp/test.ovpn', 12345, is_win=False)
+        assert linux_cmd.index('--ignore-unknown-option') < linux_cmd.index('--config')
         vc.ovpn_failed = True
         try:
             await vc.ensure_ovpn_alive(None, stats)
@@ -4297,6 +4310,15 @@ async def async_main():
     vpn_waf_threshold = max(1, int(args.vpn_waf_threshold))
     vpn_rotate_every = max(0, int(args.vpn_rotate_every))
     vpn_ip_check = not bool(args.no_vpn_ip_check)
+    local_vpns_dir = os.path.join(BASE, 'vpns')
+    ovpn_dir = (args.vpn_ovpn_dir or '').strip()
+    ovpn_country_filter = ''
+    skip_ovpn_test = bool(args.skip_ovpn_test)
+
+    def _count_ovpn(d: str) -> int:
+        if not d or not os.path.isdir(d):
+            return 0
+        return sum(1 for fn in os.listdir(d) if fn.lower().endswith('.ovpn') and os.path.isfile(os.path.join(d, fn)))
 
     if args.out:
         OUTPUT_DIR = os.path.abspath(args.out) if os.path.isabs(args.out) else os.path.join(BASE, args.out)
@@ -4322,11 +4344,16 @@ async def async_main():
         else:
             PROXY_ENABLED = False
     else:
+        avail_ovpn = _count_ovpn(ovpn_dir or local_vpns_dir)
         if _IS_TTY:
             os.system("cls" if os.name == "nt" else "clear")
+        _sub_hdr = (
+            f"OpenVPN Auto-Rotate ({avail_ovpn} .ovpn siap)" if avail_ovpn > 0
+            else "Direct / External VPN Mode"
+        )
         _print_box("", [
-            f"  {c(WHITE)}{BD}* MLBB FAST CHECKER v9.0 VPN *{W}",
-            f"  {c(GRAY)}Platform: {_PLAT['tag']} ({_PLAT['arch']}) - Direct/VPN Mode{W}",
+            f"  {c(WHITE)}{BD}* MLBB FAST CHECKER v9.0 OPENVPN *{W}",
+            f"  {c(GRAY)}Platform: {_PLAT['tag']} ({_PLAT['arch']}) - {_sub_hdr}{W}",
         ], bc=CYAN)
         input_dir = os.path.join(BASE, 'input')
         default_combo = os.path.join(input_dir, 'combo.txt')
@@ -4368,11 +4395,25 @@ async def async_main():
             else:
                 PROXY_FILE = os.path.abspath(args.proxy_file)
         if (not PROXY_ENABLED) and not vpn_cmd and not vpn_wait:
-            vpn_wait = ask_yn("Pause tunggu ganti server VPN manual jika IP kena WAF?", default='n')
-            if not vpn_wait:
-                cd_str = ask("WAF cooldown detik jika IP VPN kena limit", str(int(waf_cooldown)))
-                if cd_str.isdigit():
-                    waf_cooldown = max(3.0, float(cd_str))
+            if not ovpn_dir and avail_ovpn > 0:
+                print(f"  {c(GRAY)}Mode VPN: [1] OpenVPN Auto ({avail_ovpn} .ovpn)  [2] Manual VPN  [3] Direct{W}")
+                v_mode = ask("Pilih mode jaringan (1-3)", "1")
+                if v_mode == "1":
+                    ovpn_dir = local_vpns_dir
+                elif v_mode == "2":
+                    vpn_wait = True
+            if ovpn_dir:
+                ovpn_country_filter = ask("Filter negara .ovpn (mis: sg,jp,us | Enter=semua)", "")
+                th_str = ask("Auto-rotasi OpenVPN setelah berapa WAF berturut-turut?", str(vpn_waf_threshold))
+                if th_str.isdigit() and int(th_str) >= 1:
+                    vpn_waf_threshold = int(th_str)
+                skip_ovpn_test = not ask_yn("Uji koneksi semua .ovpn ke API Moonton di awal?", default='n' if args.skip_ovpn_test else 'y')
+            elif not vpn_wait:
+                vpn_wait = ask_yn("Pause tunggu ganti server VPN manual jika IP kena WAF?", default='n')
+                if not vpn_wait:
+                    cd_str = ask("WAF cooldown detik jika IP VPN kena limit", str(int(waf_cooldown)))
+                    if cd_str.isdigit():
+                        waf_cooldown = max(3.0, float(cd_str))
 
     NUM_CONTEXTS = workers
 
@@ -4398,8 +4439,14 @@ async def async_main():
             vpn_cmd=vpn_cmd, vpn_wait=vpn_wait, waf_threshold=vpn_waf_threshold,
             waf_cooldown=waf_cooldown, rotate_every=vpn_rotate_every,
             ip_check=vpn_ip_check, current_ip=vpn_ip_init,
-            ovpn_dir=args.vpn_ovpn_dir, ovpn_auth=args.vpn_ovpn_auth,
+            ovpn_dir=ovpn_dir, ovpn_auth=args.vpn_ovpn_auth,
         )
+        if vpn_coord and vpn_coord.ovpn_files and ovpn_country_filter.strip():
+            prefixes = tuple(p.strip().lower() for p in ovpn_country_filter.split(',') if p.strip())
+            filtered = [f for f in vpn_coord.ovpn_files if os.path.basename(f).lower().startswith(prefixes)]
+            if not filtered:
+                raise RuntimeError(f"Tidak ada file .ovpn yang cocok dengan filter '{ovpn_country_filter}'")
+            vpn_coord.ovpn_files = filtered
     except RuntimeError as ve:
         p_out(f"{c(RED)}[!] {ve}{W}")
         return
@@ -4507,7 +4554,7 @@ async def async_main():
             p_out(f"{c(RED)}[!] {le}{W}")
             return
         if vpn_coord and vpn_coord.ovpn_files:
-            if not args.skip_ovpn_test:
+            if not skip_ovpn_test:
                 good_ovpns = await vpn_coord.probe_ovpns()
                 if not good_ovpns:
                     p_out(f"\n  {c(RED)}{BD}[!] Semua config OpenVPN gagal terhubung ke API Moonton.{W}")
