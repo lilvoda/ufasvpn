@@ -1,0 +1,11 @@
+.venv/
+.venv_old/
+.cloak_old_cache/
+__pycache__/
+*.py[cod]
+output/
+input/
+vpns/
+*.lock
+.browser_vpn_cache_state.json*
+*.log
