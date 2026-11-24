@@ -11,7 +11,7 @@ Checker VPN-first berbasis CloakBrowser `0.6.5` keyless (`Windows` / `Linux` / `
 - **Termux Native (Android):**
   ```bash
   pkg update && pkg install -y python chromium
-  pip install playwright pycryptodome colorama
+  pip install playwright pycryptodome zstandard colorama
   ```
 
 ## Jalankan

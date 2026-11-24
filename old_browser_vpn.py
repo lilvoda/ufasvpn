@@ -4369,6 +4369,8 @@ async def async_main():
             p_out(f"{c(GREEN)}[*] Player Info Lookup : AKTIF ({len(dm.devices)} devices){W}")
         except Exception as e:
             p_out(f"{c(GOLD)}[!] DeviceManager init note: {e}{W}")
+    elif INFO_IMPORT_ERR:
+        p_out(f"{c(GOLD)}[!] Player Info Lookup NONAKTIF ({INFO_IMPORT_ERR}){W}")
 
     # Pastikan hanya 1 instance browser.py berjalan agar seat CloakBrowser & CPU tidak bentrok
     _inst_lock = None
