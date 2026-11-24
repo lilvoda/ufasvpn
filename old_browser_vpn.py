@@ -2347,7 +2347,11 @@ class VpnCoordinator:
                         if os.name == 'nt' and 'auth_failed' not in low_m:
                             p_out(f" {c(GOLD)}[!] Tip Windows: jalankan terminal sebagai Administrator agar OpenVPN bisa membuat TUN.{W}")
                         elif os.name != 'nt' and 'auth_failed' not in low_m:
-                            p_out(f" {c(GOLD)}[!] Tip Linux: jalankan script dengan sudo.{W}")
+                            is_root = hasattr(os, 'geteuid') and os.geteuid() == 0
+                            if is_root and ('cannot open tun' in low_m or 'no such file' in low_m):
+                                p_out(f" {c(GOLD)}[!] Tip Proxmox/LXC: /dev/net/tun belum aktif di host; tambahkan device passthrough di host node.{W}")
+                            elif not is_root:
+                                p_out(f" {c(GOLD)}[!] Tip Linux: jalankan script dengan sudo.{W}")
                         break
                     continue
             ok_mt, mt_reason, ms = await _probe_direct_moonton_ms(timeout_s=6.0)
@@ -3396,6 +3400,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
     cur_proxy_info   = pool[pool_idx] if pool else None
     rot_user_info    = None
     worker_epoch     = 0
+    ctx_vpn_epoch    = 0
     slider_cleared   = False
     ctx_counted      = False
     _acct_retries    = acct_retries if acct_retries is not None else {}
@@ -3472,7 +3477,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
 
     async def open_context_and_page(max_attempts: int = 4, rotate_ip: bool = False) -> bool:
         """Buka context baru pada sticky proxy + navigasi ke login page."""
-        nonlocal worker_epoch, ctx, page, page2, rot_user_info, cur_proxy_info, pool_idx, slider_cleared, ctx_counted, cur_browser
+        nonlocal worker_epoch, ctx_vpn_epoch, ctx, page, page2, rot_user_info, cur_proxy_info, pool_idx, slider_cleared, ctx_counted, cur_browser
         if wave_limit and stats['checked'] >= wave_limit:
             return False
         if rotate_ip:
@@ -3620,6 +3625,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                     "tgt.appendChild(s); }; addS(); if (!document.head) document.addEventListener('DOMContentLoaded', addS, {once:true}); })()"
                 )
                 stats['proxy_ctx'] += 1
+                ctx_vpn_epoch = vpn_coord.epoch if vpn_coord else 0
                 page = await ctx.new_page()
                 await _attach_page(page)
                 _ctx_dt = time.monotonic() - t_ctx0
@@ -3890,7 +3896,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                     async with ctx_cond:
                         while recovering:
                             await ctx_cond.wait()
-                        if page is None or ctx is None:
+                        if page is None or ctx is None or (vpn_coord is not None and ctx_vpn_epoch != vpn_coord.epoch):
                             need_recover_gen = ctx_gen
                         else:
                             p_tab = page if tab_idx == 0 else page2
@@ -4401,15 +4407,12 @@ async def async_main():
                     vpn_wait = True
                 else:
                     ovpn_dir = local_vpns_dir
+            elif not ovpn_dir:
+                p_out(f"  {c(GOLD)}[!] Folder vpns/ kosong -> masuk Mode Manual VPN.{W}")
+                vpn_wait = True
             if ovpn_dir:
                 vpn_waf_threshold = 5
                 skip_ovpn_test = False
-            elif not vpn_wait:
-                vpn_wait = ask_yn("Pause tunggu ganti server VPN manual jika IP kena WAF?", default='n')
-                if not vpn_wait:
-                    cd_str = ask("WAF cooldown detik jika IP VPN kena limit", str(int(waf_cooldown)))
-                    if cd_str.isdigit():
-                        waf_cooldown = max(3.0, float(cd_str))
 
     NUM_CONTEXTS = workers
 
@@ -4650,7 +4653,7 @@ async def async_main():
 
         try:
             wave_idx = 0
-            while combo_q.pending > 0:
+            while combo_q.pending > 0 and not (vpn_coord and vpn_coord.ovpn_failed):
                 _PROXY_FAILS.clear()
                 checked_before = stats['checked']
                 wave_limit = checked_before + WAVE_REFRESH_EVERY
@@ -4669,6 +4672,9 @@ async def async_main():
 
                 await asyncio.gather(*tasks)
 
+                if vpn_coord and vpn_coord.ovpn_failed:
+                    aborted_on_errors = True
+                    break
                 if combo_q.pending <= 0:
                     break
                 if stats['checked'] == checked_before or stats['checked'] < wave_limit:
