@@ -6,4 +6,5 @@ __pycache__/
 output/
 *.lock
 .browser_vpn_cache_state.json*
+.ovpn_probe_cache.json*
 *.log

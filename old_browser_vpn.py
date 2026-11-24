@@ -2177,7 +2177,7 @@ class VpnCoordinator:
             cmd.extend(['--auth-user-pass', os.path.abspath(self.ovpn_auth)])
         return cmd
 
-    async def start_ovpn(self, cfg_override: str = '', timeout_s: float = 22.0) -> tuple[bool, str]:
+    async def start_ovpn(self, cfg_override: str = '', timeout_s: float = 22.0, settle_s: float = 2.0) -> tuple[bool, str]:
         global _ovpn_pid
         await self.stop_ovpn()
         if not self.ovpn_bin or (not cfg_override and not self.ovpn_files):
@@ -2255,7 +2255,8 @@ class VpnCoordinator:
             except Exception:
                 pass
         asyncio.create_task(_drain())
-        await asyncio.sleep(2.0)
+        if settle_s > 0:
+            await asyncio.sleep(settle_s)
         if os.name == 'nt':
             try:
                 p_dns = await asyncio.create_subprocess_exec(
@@ -2311,8 +2312,43 @@ class VpnCoordinator:
             except Exception:
                 pass
 
-    async def probe_ovpns(self) -> list[str]:
-        """Uji semua file .ovpn satu per satu ke API Moonton (filter mati/no-internet, urut tercepat)."""
+    def _ovpn_cache_path(self) -> str:
+        return os.path.join(os.path.abspath(self.ovpn_dir or BASE), '.ovpn_probe_cache.json')
+
+    @staticmethod
+    def _ovpn_sig(cfg: str) -> list[int]:
+        st = os.stat(cfg)
+        return [int(getattr(st, 'st_mtime_ns', int(st.st_mtime * 1e9))), int(st.st_size)]
+
+    def _load_probe_cache(self, ttl_s: float = 21600.0) -> dict:
+        p = self._ovpn_cache_path()
+        try:
+            if not os.path.isfile(p):
+                return {}
+            with open(p, encoding='utf-8') as f:
+                raw = json.load(f)
+            if not isinstance(raw, dict):
+                return {}
+            now_t = time.time()
+            return {
+                k: v for k, v in raw.items()
+                if isinstance(v, dict) and (now_t - float(v.get('ts', 0))) <= ttl_s
+            }
+        except Exception:
+            return {}
+
+    def _save_probe_cache(self, cache: dict):
+        try:
+            p = self._ovpn_cache_path()
+            tmp = p + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(cache, f, indent=1)
+            os.replace(tmp, p)
+        except Exception:
+            pass
+
+    async def probe_ovpns(self, use_cache: bool = True, cache_ttl_s: float = 21600.0) -> list[str]:
+        """Uji semua file .ovpn ke API Moonton (cache 6 jam + fast settle + parallel IP check, buang yang gagal, urut tercepat)."""
         if not self.ovpn_files:
             return []
         if os.name == 'nt':
@@ -2326,22 +2362,47 @@ class VpnCoordinator:
         await self._ensure_warp_off()
         await self._cleanup_win_ovpn_state()
         total = len(self.ovpn_files)
-        p_out(f"{c(CYAN)}[*] Menguji {total} config OpenVPN ke API Moonton (sekali per satu)...{W}")
+        cache = self._load_probe_cache(cache_ttl_s) if use_cache else {}
         live: list[tuple[int, str, str]] = []
+        to_probe: list[str] = []
+        cached_drops = 0
+
+        for cfg in self.ovpn_files:
+            name = os.path.basename(cfg)
+            ent = cache.get(name) if use_cache else None
+            try:
+                sig = self._ovpn_sig(cfg)
+            except OSError:
+                continue
+            if ent and ent.get('sig') == sig:
+                if ent.get('ok'):
+                    ip_v = ent.get('ip', '')
+                    live.append((int(ent.get('ms', 999)), cfg, f" IP:{ip_v}" if ip_v else ''))
+                else:
+                    cached_drops += 1
+            else:
+                to_probe.append(cfg)
+
+        if use_cache and (live or cached_drops):
+            p_out(f"{c(CYAN)}[*] Cache .ovpn (<6j): {len(live)} OK, {cached_drops} DROP | perlu uji: {len(to_probe)}/{total}{W}")
+        if to_probe:
+            p_out(f"{c(CYAN)}[*] Menguji {len(to_probe)} config OpenVPN ke API Moonton (fast mode)...{W}")
+
         fatal_perm = False
         win_diag_tries = 0
-        for idx, cfg in enumerate(self.ovpn_files, 1):
+        # ponytail: sequential TUN probes (OS single-default-route constraint); use 0.25s settle + parallel Moonton/IP check + 6h cache
+        for idx, cfg in enumerate(to_probe, 1):
             name = os.path.basename(cfg)
-            ok_tun, tun_msg = await self.start_ovpn(cfg_override=cfg, timeout_s=20.0)
+            ok_tun, tun_msg = await self.start_ovpn(cfg_override=cfg, timeout_s=9.0, settle_s=0.25)
             if not ok_tun:
                 low_m = tun_msg.lower()
                 if os.name == 'nt' and (not self.ovpn_disable_dco) and ('netsh:' in low_m or 'command failed' in low_m):
                     p_out(f" {c(GOLD)}[*] {name} netsh/DCO gagal -> coba TAP (--disable-dco)...{W}")
                     self.ovpn_disable_dco = True
-                    ok_tun, tun_msg = await self.start_ovpn(cfg_override=cfg, timeout_s=20.0)
+                    ok_tun, tun_msg = await self.start_ovpn(cfg_override=cfg, timeout_s=9.0, settle_s=0.25)
                     low_m = tun_msg.lower()
                 if not ok_tun:
-                    p_out(f" {c(RED)}[DROP]{W} [{idx:>2}/{total}] {name} -> {c(GOLD)}{tun_msg[:58]}{W}")
+                    p_out(f" {c(RED)}[DROP]{W} [{idx:>2}/{len(to_probe)}] {name} -> {c(GOLD)}{tun_msg[:58]}{W}")
                     if any(k in low_m for k in ('access is denied', 'operation not permitted', 'auth_failed', 'cannot open tun')):
                         fatal_perm = True
                         if os.name == 'nt' and 'auth_failed' not in low_m:
@@ -2353,8 +2414,29 @@ class VpnCoordinator:
                             elif not is_root:
                                 p_out(f" {c(GOLD)}[!] Tip Linux: jalankan script dengan sudo.{W}")
                         break
+                    try:
+                        cache[name] = {'sig': self._ovpn_sig(cfg), 'ts': time.time(), 'ok': False, 'reason': tun_msg[:40]}
+                        self._save_probe_cache(cache)
+                    except OSError:
+                        pass
                     continue
-            ok_mt, mt_reason, ms = await _probe_direct_moonton_ms(timeout_s=6.0)
+
+            async def _probe_pair():
+                if self.ip_check:
+                    mt_res, ip_res = await asyncio.gather(
+                        _probe_direct_moonton_ms(timeout_s=4.0),
+                        fetch_public_ip(timeout_s=2.5),
+                    )
+                    return mt_res, ip_res
+                return await _probe_direct_moonton_ms(timeout_s=4.0), 'unknown'
+
+            (ok_mt, mt_reason, ms), ip_val = await _probe_pair()
+            if (not ok_mt) and ('405' not in mt_reason):
+                await asyncio.sleep(0.6)
+                (ok_mt, mt_reason, ms), ip_val2 = await _probe_pair()
+                if ip_val == 'unknown' and ip_val2 != 'unknown':
+                    ip_val = ip_val2
+
             if (not ok_mt) and os.name == 'nt' and win_diag_tries < 2:
                 win_diag_tries += 1
                 dco_was_forced = self.ovpn_disable_dco
@@ -2362,18 +2444,18 @@ class VpnCoordinator:
                 if not dco_was_forced:
                     p_out(f" {c(GOLD)}[*] {name} konek tapi tidak tembus ({mt_reason}) -> coba fallback TAP (--disable-dco)...{W}")
                     self.ovpn_disable_dco = True
-                    ok2, _ = await self.start_ovpn(cfg_override=cfg, timeout_s=20.0)
+                    ok2, _ = await self.start_ovpn(cfg_override=cfg, timeout_s=9.0, settle_s=0.5)
                     if ok2:
-                        ok_mt, mt_reason, ms = await _probe_direct_moonton_ms(timeout_s=6.0)
+                        ok_mt, mt_reason, ms = await _probe_direct_moonton_ms(timeout_s=4.0)
                 if ok_mt and not dco_was_forced:
                     p_out(f" {c(GREEN)}[*] Mode TAP (--disable-dco) berhasil menembus API Moonton! ✓{W}")
                 else:
                     await self.stop_ovpn()
                     p_out(f" {c(GOLD)}[*] Masih gagal -> coba bypass block-outside-dns...{W}")
                     self.ovpn_ignore_dns_block = True
-                    ok3, _ = await self.start_ovpn(cfg_override=cfg, timeout_s=20.0)
+                    ok3, _ = await self.start_ovpn(cfg_override=cfg, timeout_s=9.0, settle_s=0.5)
                     if ok3:
-                        ok_mt, mt_reason, ms = await _probe_direct_moonton_ms(timeout_s=6.0)
+                        ok_mt, mt_reason, ms = await _probe_direct_moonton_ms(timeout_s=4.0)
                     if ok_mt:
                         p_out(f" {c(GREEN)}[*] Mode bypass block-outside-dns berhasil! ✓{W}")
                     else:
@@ -2382,17 +2464,23 @@ class VpnCoordinator:
                             p_out(f" {c(GOLD)}[DIAG] Exit IP check saat tunnel aktif: {raw_ip_chk}{W}")
                         self.ovpn_disable_dco = dco_was_forced
                         self.ovpn_ignore_dns_block = False
-            ip_str = ''
-            if ok_mt and self.ip_check:
-                ip_val = await fetch_public_ip(timeout_s=3.0)
-                if ip_val != 'unknown':
-                    ip_str = f" IP:{ip_val}"
+
+            ip_str = f" IP:{ip_val}" if (ok_mt and ip_val != 'unknown') else ''
             await self.stop_ovpn()
+            try:
+                cache[name] = {
+                    'sig': self._ovpn_sig(cfg), 'ts': time.time(),
+                    'ok': bool(ok_mt), 'ms': int(ms),
+                    'ip': '' if ip_val == 'unknown' else ip_val,
+                }
+                self._save_probe_cache(cache)
+            except OSError:
+                pass
             if ok_mt:
                 live.append((ms, cfg, ip_str))
-                p_out(f" {c(GREEN)}[ OK ]{W} [{idx:>2}/{total}] {name} -> {ms}ms{ip_str}")
+                p_out(f" {c(GREEN)}[ OK ]{W} [{idx:>2}/{len(to_probe)}] {name} -> {ms}ms{ip_str}")
             else:
-                p_out(f" {c(RED)}[DROP]{W} [{idx:>2}/{total}] {name} -> {c(GOLD)}{mt_reason}{W}")
+                p_out(f" {c(RED)}[DROP]{W} [{idx:>2}/{len(to_probe)}] {name} -> {c(GOLD)}{mt_reason}{W}")
 
         await self.stop_ovpn()
         if fatal_perm or not live:
@@ -4235,6 +4323,7 @@ async def async_main():
     pa.add_argument('--vpn-ovpn-dir', type=str, default='', help='Folder berisi file *.ovpn untuk auto-rotate OpenVPN (Windows/Linux)')
     pa.add_argument('--vpn-ovpn-auth', type=str, default='', help='File auth OpenVPN (2 baris: user & pass; default auto-deteksi auth.txt)')
     pa.add_argument('--skip-ovpn-test', action='store_true', help='Lewati pre-test .ovpn ke API Moonton di awal')
+    pa.add_argument('--retest-ovpn', action='store_true', help='Paksa uji ulang semua .ovpn (abaikan cache 6 jam)')
     pa.add_argument('--test-ovpn-only', action='store_true', help='Uji semua file .ovpn ke API Moonton lalu keluar')
     pa.add_argument('--vpn-wait', action='store_true', help='Pause & tunggu exit IP berubah saat ganti server VPN manual')
     pa.add_argument('--vpn-waf-threshold', type=int, default=5, help='Jumlah WAF/RATE beruntun sebelum jeda/rotasi VPN')
@@ -4276,6 +4365,18 @@ async def async_main():
         assert vc.consec_waf_rate == 0 and vc.label() == 'VPN · Direct' and not vc.ovpn_started
         linux_cmd = vc._build_ovpn_cmd('/tmp/test.ovpn', 12345, is_win=False)
         assert linux_cmd.index('--ignore-unknown-option') < linux_cmd.index('--config')
+        import tempfile
+        with tempfile.TemporaryDirectory() as _td:
+            vc.ovpn_dir = _td
+            _fp = os.path.join(_td, 'a.ovpn')
+            open(_fp, 'w').write('client\n')
+            vc._save_probe_cache({
+                'a.ovpn': {'sig': vc._ovpn_sig(_fp), 'ts': time.time(), 'ok': True, 'ms': 123},
+                'stale.ovpn': {'sig': [1, 1], 'ts': time.time() - 30000.0, 'ok': True, 'ms': 50},
+            })
+            _lc = vc._load_probe_cache(ttl_s=21600.0)
+            assert 'a.ovpn' in _lc and 'stale.ovpn' not in _lc
+        vc.ovpn_dir = ''
         vc.ovpn_failed = True
         try:
             await vc.ensure_ovpn_alive(None, stats)
@@ -4299,7 +4400,7 @@ async def async_main():
                 ip_check=not bool(args.no_vpn_ip_check),
                 ovpn_dir=ovpn_dir_t, ovpn_auth=args.vpn_ovpn_auth,
             )
-            await vc_t.probe_ovpns()
+            await vc_t.probe_ovpns(use_cache=False)
         except RuntimeError as ve:
             p_out(f"{c(RED)}[!] {ve}{W}")
         finally:
@@ -4548,7 +4649,7 @@ async def async_main():
             return
         if vpn_coord and vpn_coord.ovpn_files:
             if not skip_ovpn_test:
-                good_ovpns = await vpn_coord.probe_ovpns()
+                good_ovpns = await vpn_coord.probe_ovpns(use_cache=not bool(args.retest_ovpn))
                 if not good_ovpns:
                     p_out(f"\n  {c(RED)}{BD}[!] Semua config OpenVPN gagal terhubung ke API Moonton.{W}")
                     p_out(f"  {c(GRAY)}Eksekusi dibatalkan otomatis untuk melindungi IP asli kamu.{W}\n")
