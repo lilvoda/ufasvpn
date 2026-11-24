@@ -4,8 +4,6 @@
 __pycache__/
 *.py[cod]
 output/
-input/proxies.txt
-vpns/
 *.lock
 .browser_vpn_cache_state.json*
 *.log
