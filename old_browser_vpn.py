@@ -2049,6 +2049,7 @@ class VpnCoordinator:
         self.ovpn_files: list[str] = []
         self.ovpn_idx = 0
         self._ovpn_proc = None
+        self._ovpn_mgmt_port = 0
         self.ovpn_disable_dco = False
         self.ovpn_ignore_dns_block = False
         self.ovpn_failed = False
@@ -2082,31 +2083,74 @@ class VpnCoordinator:
         self.gate = asyncio.Event()
         self.gate.set()
 
+    async def _cleanup_win_ovpn_state(self):
+        """Bersihkan sisa IP/route OpenVPN yang tertinggal jika proses sebelumnya ter-kill paksa."""
+        if os.name != 'nt':
+            return
+        ps_cmd = (
+            "Get-NetAdapter -Name 'OpenVPN*' -ErrorAction SilentlyContinue | "
+            "Where-Object {$_.Status -ne 'Up'} | ForEach-Object { "
+            "Remove-NetRoute -InterfaceIndex $_.ifIndex -DestinationPrefix '0.0.0.0/1','128.0.0.0/1' -Confirm:$false -ErrorAction SilentlyContinue; "
+            "netsh interface ip set address $_.ifIndex dhcp | Out-Null "
+            "}"
+        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                'powershell', '-NoProfile', '-Command', ps_cmd,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=5.0)
+        except Exception:
+            pass
+
     async def stop_ovpn(self):
         global _ovpn_pid
         p = self._ovpn_proc
+        mgmt_port = self._ovpn_mgmt_port
         self._ovpn_proc = None
+        self._ovpn_mgmt_port = 0
+        had_force_kill = False
         if p is not None:
             try:
                 if p.returncode is None:
-                    if os.name != 'nt':
+                    if mgmt_port:
                         try:
-                            os.killpg(p.pid, signal.SIGTERM)
-                        except Exception:
-                            p.terminate()
-                    else:
-                        p.terminate()
-                    try:
-                        await asyncio.wait_for(p.wait(), timeout=3.0)
-                    except asyncio.TimeoutError:
-                        _kill_pid_tree(p.pid)
-                        try:
-                            await asyncio.wait_for(p.wait(), timeout=2.0)
+                            reader, writer = await asyncio.wait_for(
+                                asyncio.open_connection('127.0.0.1', mgmt_port), timeout=1.5
+                            )
+                            writer.write(b"signal SIGTERM\n")
+                            await writer.drain()
+                            writer.close()
+                            try:
+                                await writer.wait_closed()
+                            except Exception:
+                                pass
+                            await asyncio.wait_for(p.wait(), timeout=3.5)
                         except Exception:
                             pass
+                    if p.returncode is None:
+                        had_force_kill = True
+                        if os.name != 'nt':
+                            try:
+                                os.killpg(p.pid, signal.SIGTERM)
+                            except Exception:
+                                p.terminate()
+                        else:
+                            p.terminate()
+                        try:
+                            await asyncio.wait_for(p.wait(), timeout=3.0)
+                        except asyncio.TimeoutError:
+                            _kill_pid_tree(p.pid)
+                            try:
+                                await asyncio.wait_for(p.wait(), timeout=2.0)
+                            except Exception:
+                                pass
             except Exception:
+                had_force_kill = True
                 _kill_pid_tree(getattr(p, 'pid', None))
         _ovpn_pid = None
+        if had_force_kill:
+            await self._cleanup_win_ovpn_state()
 
     async def start_ovpn(self, cfg_override: str = '', timeout_s: float = 22.0) -> tuple[bool, str]:
         global _ovpn_pid
@@ -2120,7 +2164,17 @@ class VpnCoordinator:
             self.ovpn_idx += 1
         if not os.path.isfile(cfg):
             return False, f"Config hilang: {os.path.basename(cfg)}"
+        mgmt_port = 0
+        try:
+            import socket
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(('127.0.0.1', 0))
+                mgmt_port = s.getsockname()[1]
+        except Exception:
+            mgmt_port = 0
         cmd = [self.ovpn_bin, '--config', cfg, '--auth-nocache']
+        if mgmt_port:
+            cmd.extend(['--management', '127.0.0.1', str(mgmt_port)])
         if os.name != 'nt':
             cmd.extend(['--ignore-unknown-option', 'block-outside-dns'])
         else:
@@ -2135,6 +2189,7 @@ class VpnCoordinator:
             kw['start_new_session'] = True
         proc = await asyncio.create_subprocess_exec(*cmd, **kw)
         self._ovpn_proc = proc
+        self._ovpn_mgmt_port = mgmt_port
         _ovpn_pid = proc.pid
         deadline = time.monotonic() + float(timeout_s)
         last_line = ''
@@ -2251,6 +2306,7 @@ class VpnCoordinator:
             except Exception:
                 pass
         await self._ensure_warp_off()
+        await self._cleanup_win_ovpn_state()
         total = len(self.ovpn_files)
         p_out(f"{c(CYAN)}[*] Menguji {total} config OpenVPN ke API Moonton (sekali per satu)...{W}")
         live: list[tuple[int, str, str]] = []
@@ -2260,16 +2316,22 @@ class VpnCoordinator:
             name = os.path.basename(cfg)
             ok_tun, tun_msg = await self.start_ovpn(cfg_override=cfg, timeout_s=20.0)
             if not ok_tun:
-                p_out(f" {c(RED)}[DROP]{W} [{idx:>2}/{total}] {name} -> {c(GOLD)}{tun_msg[:58]}{W}")
                 low_m = tun_msg.lower()
-                if any(k in low_m for k in ('access is denied', 'operation not permitted', 'auth_failed', 'cannot open tun', 'netsh:', 'command failed')):
-                    fatal_perm = True
-                    if os.name == 'nt' and 'auth_failed' not in low_m:
-                        p_out(f" {c(GOLD)}[!] Tip Windows: jalankan terminal sebagai Administrator agar OpenVPN bisa membuat TUN.{W}")
-                    elif os.name != 'nt' and 'auth_failed' not in low_m:
-                        p_out(f" {c(GOLD)}[!] Tip Linux: jalankan script dengan sudo.{W}")
-                    break
-                continue
+                if os.name == 'nt' and (not self.ovpn_disable_dco) and ('netsh:' in low_m or 'command failed' in low_m):
+                    p_out(f" {c(GOLD)}[*] {name} netsh/DCO gagal -> coba TAP (--disable-dco)...{W}")
+                    self.ovpn_disable_dco = True
+                    ok_tun, tun_msg = await self.start_ovpn(cfg_override=cfg, timeout_s=20.0)
+                    low_m = tun_msg.lower()
+                if not ok_tun:
+                    p_out(f" {c(RED)}[DROP]{W} [{idx:>2}/{total}] {name} -> {c(GOLD)}{tun_msg[:58]}{W}")
+                    if any(k in low_m for k in ('access is denied', 'operation not permitted', 'auth_failed', 'cannot open tun')):
+                        fatal_perm = True
+                        if os.name == 'nt' and 'auth_failed' not in low_m:
+                            p_out(f" {c(GOLD)}[!] Tip Windows: jalankan terminal sebagai Administrator agar OpenVPN bisa membuat TUN.{W}")
+                        elif os.name != 'nt' and 'auth_failed' not in low_m:
+                            p_out(f" {c(GOLD)}[!] Tip Linux: jalankan script dengan sudo.{W}")
+                        break
+                    continue
             ok_mt, mt_reason, ms = await _probe_direct_moonton_ms(timeout_s=6.0)
             if (not ok_mt) and os.name == 'nt' and not tried_win_diag:
                 tried_win_diag = True
@@ -2322,6 +2384,7 @@ class VpnCoordinator:
         if not self.ovpn_files:
             return True
         await self._ensure_warp_off()
+        await self._cleanup_win_ovpn_state()
         if not _TUI_ACTIVE:
             p_out(f"{c(CYAN)}[*] Menghubungkan OpenVPN tercepat ({os.path.basename(self.ovpn_files[0])})...{W}")
         for _ in range(min(3, len(self.ovpn_files))):
