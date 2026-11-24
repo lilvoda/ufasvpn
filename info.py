@@ -407,17 +407,21 @@ class BaseConnection:
         self.socket.connect((self.host, self.port))
 
     def cleanup(self):
-        if self.socket:
+        sock = self.socket
+        self.socket = None
+        self.sequence = 1
+        self.queue_data = b''
+        if sock:
             try:
-                self.socket.setsockopt(
+                sock.setsockopt(
                     socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0)
                 )
-                self.socket.close()
             except Exception:
                 pass
-            self.socket = None
-            self.sequence = 1
-        self.queue_data = b''
+            try:
+                sock.close()
+            except Exception:
+                pass
 
     def send_data(self, cmd_id: int, sdp: SdpStruct):
         packet = SdpStruct({0: cmd_id, 1: self.sequence, 5: sdp.data}).data
@@ -687,11 +691,13 @@ class GameConnection(BaseConnection):
 
         return highest_role if highest_role else (None, None)
 
-    def get_role_detail(self, role_id: int) -> Optional[SdpStruct]:
+    def get_role_detail(self, role_id: int, deadline: Optional[float] = None) -> Optional[SdpStruct]:
         try:
             self.send_data(11153, SdpStruct({1: role_id}))
             timeout_count = 0
             while timeout_count < 2:
+                if deadline is not None and time.monotonic() >= deadline:
+                    break
                 cmd, res = self.recv_data()
                 if cmd is None:
                     break
@@ -704,11 +710,13 @@ class GameConnection(BaseConnection):
             pass
         return None
 
-    def get_role_info(self, role_id: int, zone_id: int) -> Optional[SdpStruct]:
+    def get_role_info(self, role_id: int, zone_id: int, deadline: Optional[float] = None) -> Optional[SdpStruct]:
         try:
             self.send_data(10143, SdpStruct({0: role_id, 1: zone_id}))
             timeout_count = 0
             while timeout_count < 2:
+                if deadline is not None and time.monotonic() >= deadline:
+                    break
                 cmd, res = self.recv_data()
                 if cmd is None:
                     break
@@ -771,7 +779,7 @@ def get_player_info(
                     if rid:
                         result, role_id, zone_id = cand, rid, zid
                         # Fast path: query basic role_info (ID, skin, rank) on same open connection (0 extra TCP handshake)
-                        ri = rconn.get_role_info(rid, zid)
+                        ri = rconn.get_role_info(rid, zid, deadline=deadline)
                         if ri and (ri.get(6) is not None or ri.get(10) is not None):
                             pd = extract_player_data(_role_detail_from_info(rid, zid, ri), ri, 0)
                             if pd:
@@ -813,9 +821,9 @@ def get_player_info(
                 conn.cleanup()
                 continue
 
-            role_info = conn.get_role_info(role_id, zone_id)
+            role_info = conn.get_role_info(role_id, zone_id, deadline=deadline)
             has_core = bool(role_info and (role_info.get(6) is not None or role_info.get(10) is not None))
-            role_detail = _role_detail_from_info(role_id, zone_id, role_info) if has_core else conn.get_role_detail(role_id)
+            role_detail = _role_detail_from_info(role_id, zone_id, role_info) if has_core else conn.get_role_detail(role_id, deadline=deadline)
             if not role_detail:
                 conn.cleanup()
                 continue

