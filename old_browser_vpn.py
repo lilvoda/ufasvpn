@@ -3804,6 +3804,7 @@ def _maybe_rotate_vpnpool_slot(proxy: dict | None):
                 p = await asyncio.create_subprocess_exec(
                     'bash', sh, 'rotate', str(slot),
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                    start_new_session=(os.name != 'nt'),
                 )
                 try:
                     await asyncio.wait_for(p.communicate(), timeout=35.0)
@@ -4220,6 +4221,17 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                 if picked is None:
                     for _pk_clr in [k for k in list(_PROXY_FAILS) if k[0] not in _rot_set]:
                         _PROXY_FAILS.pop(_pk_clr, None)
+                    for _ in range(len(pool)):
+                        pool_idx = (pool_idx + 1) % len(pool)
+                        cand = pool[pool_idx]
+                        if cand.get('server', '') not in _rot_set:
+                            picked = cand
+                            break
+                if picked is None:
+                    # Wait cleanly when all pool slots are mid-rotation (e.g. 1-slot Multi-VPN)
+                    _wait_end = time.monotonic() + 18.0
+                    while time.monotonic() < _wait_end and all(c.get('server', '') in _rot_set for c in pool):
+                        await asyncio.sleep(0.5)
                     for _ in range(len(pool)):
                         pool_idx = (pool_idx + 1) % len(pool)
                         cand = pool[pool_idx]
@@ -5628,11 +5640,12 @@ async def async_main():
                 _pool_sh = os.path.join(BASE, 'vpn_pool.sh')
                 if os.name != 'nt' and os.path.isfile(_pool_sh) and not args.no_prompt:
                     if ask_yn("Multi-VPN proxy pool? (anti-pause, tiap worker beda IP)", default='y'):
-                        _miss = [b for b in ('openvpn', 'microsocks', 'iptables', 'ip') if not shutil.which(b)]
+                        _sys_path = os.environ.get('PATH', '') + ':/usr/sbin:/sbin'
+                        _miss = [b for b in ('openvpn', 'microsocks', 'iptables', 'ip', 'sysctl', 'flock') if not shutil.which(b, path=_sys_path)]
                         if hasattr(os, 'geteuid') and os.geteuid() != 0:
                             p_out(f"  {c(GOLD)}[!] Multi-VPN butuh root/sudo -> lanjut OpenVPN tunggal.{W}")
                         elif _miss:
-                            p_out(f"  {c(GOLD)}[!] Multi-VPN butuh {', '.join(_miss)} (apt-get install -y openvpn microsocks iptables) -> lanjut OpenVPN tunggal.{W}")
+                            p_out(f"  {c(GOLD)}[!] Multi-VPN butuh {', '.join(_miss)} (apt-get install -y openvpn microsocks iptables procps util-linux) -> lanjut OpenVPN tunggal.{W}")
                         else:
                             _sl_in = ask("Jumlah tunnel Multi-VPN (1-20 / auto)", "auto").strip().lower()
                             if _sl_in in ('', 'auto', 'a'):
@@ -5641,6 +5654,9 @@ async def async_main():
                             else:
                                 multi_vpn_slots = max(1, min(20, int(_sl_in) if _sl_in.isdigit() else min(8, max(2, workers))))
                             multi_vpn_dir = _resolve_ovpn_dir_input(ovpn_dir)
+                            _avail_cfg = _count_ovpn_files(multi_vpn_dir)
+                            if _avail_cfg > 0:
+                                multi_vpn_slots = min(multi_vpn_slots, _avail_cfg)
                             multi_vpn_sh = _pool_sh
                             PROXY_ENABLED = True
                             PROXY_FILE = os.path.join(BASE, 'vpn_proxies.txt')
@@ -5811,12 +5827,16 @@ async def async_main():
         if multi_vpn_slots > 0 and multi_vpn_sh:
             if multi_vpn_auto:
                 multi_vpn_slots = max(1, min(20, spawn_w))
+            _avail_cfg = _count_ovpn_files(multi_vpn_dir)
+            if _avail_cfg > 0:
+                multi_vpn_slots = min(multi_vpn_slots, _avail_cfg)
             p_out(f"{c(CYAN)}[*] Menyalakan {multi_vpn_slots} tunnel Multi-VPN ({shortpath(multi_vpn_dir)})...{W}")
             multi_vpn_started = True
             _VPNPOOL_CFG.update({'sh': multi_vpn_sh, 'started': True, 'out_file': PROXY_FILE})
             _vp_proc = await asyncio.create_subprocess_exec(
                 'bash', multi_vpn_sh, 'start', multi_vpn_dir, str(multi_vpn_slots), PROXY_FILE,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                start_new_session=(os.name != 'nt'),
             )
             try:
                 _vp_out, _ = await asyncio.wait_for(_vp_proc.communicate(), timeout=45.0)
@@ -5824,6 +5844,10 @@ async def async_main():
                 _kill_pid_tree(_vp_proc.pid)
                 p_out(f"{c(RED)}[!] Timeout menyalakan Multi-VPN pool.{W}")
                 return
+            except BaseException:
+                if _vp_proc.returncode is None:
+                    _kill_pid_tree(_vp_proc.pid)
+                raise
             for _vln in (_vp_out or b'').decode('utf-8', errors='ignore').splitlines():
                 if _vln.strip():
                     p_out(f"  {c(GRAY)}{_vln}{W}")
@@ -6095,6 +6119,7 @@ async def async_main():
                 _sp = await asyncio.create_subprocess_exec(
                     'bash', multi_vpn_sh, 'stop',
                     stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                    start_new_session=(os.name != 'nt'),
                 )
                 await asyncio.wait_for(_sp.wait(), timeout=12.0)
             except BaseException:
