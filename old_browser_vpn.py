@@ -682,12 +682,12 @@ class SmartController:
 
     def adaptive_wait_s(self, req_dispatched: bool) -> float:
         if not req_dispatched:
-            return 3.5
+            return 5.0
         if len(self.latencies) < 5:
-            return 8.5
+            return 10.5
         vals = sorted(d for _, d in self.latencies)
         p95 = vals[min(len(vals) - 1, int(len(vals) * 0.95))]
-        return max(4.5, min(9.0, p95 * 2.5))
+        return max(7.0, min(14.0, p95 * 2.5))
 
     def record_stall(self, kind: str, dur_s: float, now_t: float | None = None):
         if dur_s < 0.25 or kind not in self.totals:
@@ -1960,7 +1960,8 @@ async def test_proxies(raw_proxies, browser=None, concurrency=16):
     median_ms = lat_sorted[len(lat_sorted) // 2]
     cutoff_ms = min(MAX_PROXY_PING_MS, max(1500, int(median_ms * 1.6)))
 
-    fast = [x for x in live if x[0] <= cutoff_ms]
+    # Keep all live local Multi-VPN slots (<=50 targets) so +50% standby backups aren't discarded as SLOW
+    fast = list(live) if len(probe_targets) <= 50 else [x for x in live if x[0] <= cutoff_ms]
     if len(fast) < min(10, len(live)):
         fast = live[:min(10, len(live))]
     for ms, idx, raw, p in live[len(fast):]:
@@ -3604,7 +3605,7 @@ async def do_login_via_browser(page, ctx, user: str, passw: str, wid: int = 0, w
         # 3. Fast client-validation check: hanya return INVALID bila client error benar-benar muncul (hindari false INVALID saat Aliyun JS lambat >2s)
         if not req_sent.is_set() and not resp_event.is_set():
             try:
-                await asyncio.wait_for(req_sent.wait(), timeout=2.0)
+                await asyncio.wait_for(req_sent.wait(), timeout=3.5)
             except asyncio.TimeoutError:
                 pass
         if not req_sent.is_set() and not resp_event.is_set() and not api_result["json"] and not api_result["had_waf"] and not api_result["proxy_err"]:
@@ -3614,13 +3615,18 @@ async def do_login_via_browser(page, ctx, user: str, passw: str, wid: int = 0, w
             except Exception:
                 pass
 
-        # Adaptive timeout: cepat fail-fast bila XHR belum terkirim, p95-scaled bila request aktif
+        # Adaptive timeout: extend cleanly if XHR dispatched late over slow VPN
         t_resp0 = time.monotonic()
         _resp_wait_s = _PERF.adaptive_wait_s(req_sent.is_set())
         try:
             await asyncio.wait_for(resp_event.wait(), timeout=_resp_wait_s)
         except asyncio.TimeoutError:
-            pass
+            if req_sent.is_set() and not resp_event.is_set():
+                _extra_s = max(2.5, _PERF.adaptive_wait_s(True) - (time.monotonic() - t_resp0))
+                try:
+                    await asyncio.wait_for(resp_event.wait(), timeout=_extra_s)
+                except asyncio.TimeoutError:
+                    pass
         _wait_dt = time.monotonic() - t_resp0
         if api_result["had_waf"]:
             _PERF.record_stall('waf', _wait_dt)
@@ -4890,7 +4896,8 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                         if cur_proxy_info and not res_data.get('proxy_407'):
                             pk = (cur_proxy_info.get('server', ''), cur_proxy_info.get('username', ''))
                             _PROXY_FAILS[pk] = _PROXY_FAILS.get(pk, 0) + 1
-                            if _PROXY_FAILS[pk] >= 3:
+                            _rot_thr = 4 if err_msg == 'timeout_waiting_response' else 3
+                            if _PROXY_FAILS[pk] >= _rot_thr:
                                 _maybe_rotate_vpnpool_slot(cur_proxy_info)
                         if not await _recover_ctx(my_gen, 'rotate'):
                             raise RuntimeError(f"w{wid}_rate_recovery_failed")
@@ -5364,10 +5371,10 @@ async def async_main():
         sc = SmartController()
         sc.reset(now_t=100.0)
         sc.configure_workers(min_w=2, start_w=6, max_w=10, auto_scale=True, now_t=100.0)
-        assert sc.adaptive_wait_s(False) == 3.5 and sc.adaptive_wait_s(True) == 8.5
+        assert sc.adaptive_wait_s(False) == 5.0 and sc.adaptive_wait_s(True) == 10.5
         for _ in range(10):
             sc.on_outcome('OK', resp_dt=2.0, now_t=105.0)
-        assert 4.5 <= sc.adaptive_wait_s(True) <= 5.5
+        assert 6.5 <= sc.adaptive_wait_s(True) <= 7.5
         # Low RAM recycles Chromium instead of scaling down workers
         act, _ = sc.decide_action(avail_mb=300.0, can_rotate_vpn=True, ctx_age=10, is_recycling=False, now_t=125.0)
         assert act == 'RECYCLE_BROWSER' and sc.target_workers == 6, (act, sc.target_workers)
