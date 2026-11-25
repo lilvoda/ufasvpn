@@ -4957,18 +4957,140 @@ def _detect_vps_hw() -> dict:
                     cpus = min(cpus, max(0.5, q / p))
         except Exception:
             pass
-    ram_cap = max(1, int(max(0.0, avail_mb - 400.0) / 135.0))
-    cpu_cap = max(2, int(round(cpus * 3.0)))
+    ram_cap = max(1, int(max(0.0, avail_mb - 450.0) / 160.0))
+    cpu_cap = max(2, int(round(cpus * 2.5)))
     hw_max = max(1, min(24, ram_cap, cpu_cap))
     if _PLAT['is_android']:
         hw_max = min(hw_max, 6)
     return {'cpus': round(cpus, 1), 'total_mb': int(total_mb), 'avail_mb': int(avail_mb), 'hw_max': hw_max}
 
+def _read_linux_cpu_ticks() -> tuple[int, int] | None:
+    """Baca (total_ticks, steal_ticks) dari /proc/stat Linux untuk deteksi VPS oversubscribed."""
+    if os.name == 'nt':
+        return None
+    try:
+        with open('/proc/stat', 'r', encoding='ascii', errors='ignore') as f:
+            parts = f.readline().split()
+        if len(parts) >= 9 and parts[0] == 'cpu':
+            vals = [int(x) for x in parts[1:11] if x.isdigit()]
+            if len(vals) >= 8:
+                return sum(vals), vals[7]
+    except Exception:
+        pass
+    return None
+
+def _calc_auto_safe_cap(cpus: float, avail_mb: float, t1_s: float, steal_pct: float = 0.0) -> int:
+    """Hitung batas worker aman berbasis kecepatan single-core nyata (V8/Chromium), steal CPU, & RAM."""
+    ram_cap = max(1, int(max(0.0, avail_mb - 450.0) / 160.0)) if avail_mb > 0 else 8
+    if steal_pct >= 12.0 or t1_s >= 0.30:
+        mult = 1.25  # Xeon lambat / host oversubscribed
+    elif steal_pct >= 5.0 or t1_s >= 0.18:
+        mult = 1.75
+    else:
+        mult = 2.5   # CPU modern cepat
+    cap = max(2, int(round(cpus * mult)))
+    if _PLAT['is_android']:
+        cap = min(cap, 6)
+    return max(1, min(24, ram_cap, cap))
+
+async def _benchmark_vps_capacity(browser, hw: dict | None = None, choose_two_tab: bool = True) -> tuple[int, bool, int, str]:
+    """Benchmark Chromium nyata (tanpa fake sleep) untuk deteksi kekuatan CPU single-core, steal, & saturation knee."""
+    hw = hw or _detect_vps_hw()
+    cpus = max(0.5, float(hw['cpus']))
+    avail_mb = float(hw['avail_mb'])
+    if browser is None:
+        fallback_n = min(4, max(1, int(hw['hw_max'])))
+        return fallback_n, False, fallback_n, f"Estimasi CPU/RAM: {cpus} vCPU · {avail_mb/1024:.1f} GB RAM -> {fallback_n}w"
+
+    _WORK_JS = (
+        "() => {"
+        " const f = document.createElement('div');"
+        " f.innerHTML = '<input type=\"text\"><input type=\"password\"><button>OK</button>';"
+        " document.body.appendChild(f);"
+        " let h = 2166136261;"
+        " for (let i = 0; i < 650000; i++) {"
+        "   h = Math.imul(h ^ (i & 255), 16777619);"
+        "   if ((i & 16383) === 0) f.firstChild.value = String(h);"
+        " }"
+        " return h;"
+        "}"
+    )
+
+    async def _one_probe() -> float:
+        c_tmp = None
+        t_s = time.perf_counter()
+        try:
+            c_tmp = await asyncio.wait_for(browser.new_context(), timeout=8.0)
+            p_tmp = await asyncio.wait_for(c_tmp.new_page(), timeout=6.0)
+            await asyncio.wait_for(p_tmp.evaluate(_WORK_JS), timeout=6.0)
+            return time.perf_counter() - t_s
+        finally:
+            if c_tmp is not None:
+                try:
+                    await asyncio.wait_for(c_tmp.close(), timeout=4.0)
+                except Exception:
+                    pass
+
+    # Warmup 1 context agar JIT/binary cache hangat, lalu ukur baseline single-context t1 nyata
+    t1 = 0.25
+    try:
+        t1 = await _one_probe()
+        t1_b = await _one_probe()
+        t1 = max(0.05, min(t1, t1_b))
+    except Exception:
+        pass
+
+    safe_cap = _calc_auto_safe_cap(cpus, avail_mb, t1, steal_pct=0.0)
+    levels = sorted({v for v in (2, 4, 6, 8, 10, 12, 16, 20, safe_cap) if 2 <= v <= safe_cap})
+    if not levels:
+        levels = [1]
+
+    best_n = 1
+    best_tp = 1.0 / max(t1, 0.05)
+    last_steal = 0.0
+
+    for n in levels:
+        st0 = _read_linux_cpu_ticks()
+        t0 = time.perf_counter()
+        res = await asyncio.gather(*(_one_probe() for _ in range(n)), return_exceptions=True)
+        dt = max(0.05, time.perf_counter() - t0)
+        st1 = _read_linux_cpu_ticks()
+        if st0 and st1 and st1[0] > st0[0]:
+            last_steal = max(0.0, (st1[1] - st0[1]) * 100.0 / (st1[0] - st0[0]))
+            safe_cap = min(safe_cap, _calc_auto_safe_cap(cpus, avail_mb, t1, steal_pct=last_steal))
+            if n > safe_cap:
+                break
+        ok_cnt = sum(1 for r in res if not isinstance(r, BaseException))
+        if ok_cnt < n:
+            break
+        tp = ok_cnt / dt
+        # Hentikan begitu latensi melebar >2.35x single-context baseline atau throughput tak lagi naik signifikan (+15%)
+        if dt > max(0.45, t1 * 2.35):
+            break
+        if tp < best_tp * 1.15:
+            break
+        if last_steal >= 12.0:
+            break
+        if _detect_vps_hw()['avail_mb'] < 380:
+            break
+        best_n, best_tp = n, tp
+
+    headroom_max = min(safe_cap, best_n + (2 if safe_cap > best_n else 0))
+    # 2-tab hanya menguntungkan bila CPU single-core cepat (t1 <= 0.22s) dan RAM longgar
+    two_t = bool(choose_two_tab and best_n <= 4 and t1 <= 0.22 and last_steal < 5.0 and avail_mb >= 1024)
+    steal_str = f" steal:{last_steal:.0f}%" if last_steal >= 1.0 else ""
+    tier = "lambat/oversub" if t1 >= 0.30 or last_steal >= 10.0 else ("sedang" if t1 >= 0.18 else "cepat")
+    summary = (
+        f"Auto Worker: CPU {cpus} vCPU ({tier}, 1-ctx {int(t1*1000)}ms{steal_str}) · "
+        f"{avail_mb/1024:.1f}GB free -> {best_n} ctx x {2 if two_t else 1} tab (max {headroom_max}w)"
+    )
+    return best_n, two_t, headroom_max, summary
+
 # ── Main Entrypoint ──────────────────────────────────────────────────────────
 async def async_main():
     pa = argparse.ArgumentParser(description='MLBB Fast Checker v9.0 VPN — Cross-Platform (Termux/Linux/Windows)')
     pa.add_argument('combo', nargs='?', default='')
-    pa.add_argument('--workers', type=int, default=0)
+    pa.add_argument('--workers', type=str, default='', help='Jumlah worker (1-30 atau "auto" untuk uji kapasitas VPS)')
     pa.add_argument('--headless', dest='headless', action='store_true', default=None)
     pa.add_argument('--no-headless', dest='headless', action='store_false', default=None)
     pa.add_argument('--debug', action='store_true')
@@ -5071,6 +5193,21 @@ async def async_main():
         assert sd_t.should_auto_heal(now_t=161.0)[0]
         _hw = _detect_vps_hw()
         assert _hw['cpus'] > 0 and _hw['total_mb'] > 0
+        # Uji akurat CPU cap: Xeon abal2 (t1=0.38s) harus dibatasi jauh lebih rendah daripada CPU cepat (t1=0.10s)
+        assert _calc_auto_safe_cap(4.0, 8192.0, 0.38, steal_pct=0.0) <= 5
+        assert _calc_auto_safe_cap(4.0, 8192.0, 0.10, steal_pct=15.0) <= 5
+        assert _calc_auto_safe_cap(4.0, 8192.0, 0.10, steal_pct=0.0) == 10
+        class _FakePage:
+            async def evaluate(self, js):
+                await asyncio.sleep(0.02)
+                return 1
+        class _FakeCtx:
+            async def new_page(self): return _FakePage()
+            async def close(self): return None
+        class _FakeBrowser:
+            async def new_context(self): return _FakeCtx()
+        _bw, _b2t, _bhmax, _bmsg = await _benchmark_vps_capacity(_FakeBrowser(), hw={'cpus': 4.0, 'total_mb': 8192, 'avail_mb': 6000, 'hw_max': 10}, choose_two_tab=True)
+        assert 1 <= _bw <= _bhmax <= 10 and 'Auto Worker:' in _bmsg
         # 6. Unified SmartController brain (AIMD scaling, adaptive timeout, plateau calibration, node reputation)
         sc = SmartController()
         sc.reset(now_t=100.0)
@@ -5152,6 +5289,7 @@ async def async_main():
 
     global DEBUG, HEADLESS, NUM_CONTEXTS, TWO_TAB, PROXY_ENABLED, PROXY_FILE, OUTPUT_DIR, _TUI_ACTIVE, _pw_instance, _driver_pid, _lookup_exec
     TWO_TAB = bool(args.two_tab)
+    auto_two_tab = False
 
     if args.test_ovpn_only:
         ovpn_dir_t = args.vpn_ovpn_dir
@@ -5185,7 +5323,11 @@ async def async_main():
         return
 
     combo_path = ''
+    _w_raw = str(args.workers or '').strip().lower()
+    auto_workers = (_w_raw == 'auto')
+    _w_arg = int(_w_raw) if _w_raw.isdigit() else 0
     workers = 2 if _PLAT['is_android'] else 4
+    hw_info = _detect_vps_hw()
     vpn_cmd = args.vpn_cmd
     vpn_wait = bool(args.vpn_wait)
     waf_cooldown = max(3.0, float(args.waf_cooldown))
@@ -5198,10 +5340,14 @@ async def async_main():
     if args.out:
         OUTPUT_DIR = os.path.abspath(args.out) if os.path.isabs(args.out) else os.path.join(BASE, args.out)
 
-    if args.no_prompt or (args.combo and args.workers):
+    if args.no_prompt or (args.combo and (_w_arg > 0 or auto_workers)):
         combo_path = args.combo or os.path.join(BASE, 'combo.txt')
         default_w = 2 if _PLAT['is_android'] else 4
-        workers = max(1, min(30, args.workers or default_w))
+        if auto_workers:
+            workers = hw_info['hw_max']
+            auto_two_tab = not bool(args.two_tab)
+        else:
+            workers = max(1, min(30, _w_arg or default_w))
         HEADLESS = args.headless if args.headless is not None else True
         DEBUG = args.debug
         if args.proxy_file:
@@ -5258,9 +5404,23 @@ async def async_main():
                     break
 
         rec_w = 2 if _PLAT['is_android'] else 4
-        workers_str = ask(f"Worker threads (1-30, rec {rec_w})", str(rec_w))
-        workers = max(1, min(30, int(workers_str) if workers_str.isdigit() else rec_w))
-        TWO_TAB = ask_yn("2-tab extra worker? (2 tab/context, lebih cepat)", default='y' if args.two_tab else 'n')
+        workers_str = ask("Worker threads (1-30 / auto)", "auto").strip().lower()
+        if workers_str in ('', 'auto', 'a'):
+            auto_workers = True
+            workers = hw_info['hw_max']
+            _tt_ans = ask("2-tab extra worker? (y/n/auto)", "y" if args.two_tab else "auto").strip().lower()
+            if _tt_ans in ('y', 'yes'):
+                TWO_TAB = True
+                auto_two_tab = False
+            elif _tt_ans in ('n', 'no'):
+                TWO_TAB = False
+                auto_two_tab = False
+            else:
+                auto_two_tab = True
+        else:
+            auto_workers = False
+            workers = max(1, min(30, int(workers_str) if workers_str.isdigit() else rec_w))
+            TWO_TAB = ask_yn("2-tab extra worker? (2 tab/context, lebih cepat)", default='y' if args.two_tab else 'n')
         HEADLESS = True if args.headless is None else args.headless
         DEBUG = bool(args.debug)
         PROXY_ENABLED = False
@@ -5355,7 +5515,11 @@ async def async_main():
             f"{vpn_coord.label()} (cmd)" if vpn_cmd else (f"{vpn_coord.label()} (manual-wait)" if vpn_wait else f"{vpn_coord.label()} (cooldown {int(waf_cooldown)}s)")
         )
     )
-    _w_cfg_str = f"{NUM_CONTEXTS} ctx x {2 if TWO_TAB else 1} tab ({NUM_CONTEXTS * (2 if TWO_TAB else 1)} streams)"
+    _w_cfg_str = (
+        f"AUTO (uji CPU/RAM real, {'auto' if auto_two_tab else ('2' if TWO_TAB else '1')}-tab)"
+        if auto_workers else
+        f"{NUM_CONTEXTS} ctx x {2 if TWO_TAB else 1} tab ({NUM_CONTEXTS * (2 if TWO_TAB else 1)} streams)"
+    )
     _print_box("CONFIGURATION", [
         f" {c(WHITE)}Platform:{W} {c(CYAN)}{_PLAT['tag']} ({_PLAT['arch']}){W}",
         f" {c(WHITE)}Queue   :{W} {c(GREEN)}{len(queue):,} accounts{W} {c(GRAY)}(tot:{len(combos):,}, done:{len(done_accounts):,}){W}",
@@ -5465,7 +5629,17 @@ async def async_main():
 
         spawn_w = min(NUM_CONTEXTS, max(1, len(queue)))
         start_w = spawn_w
-        NUM_CONTEXTS = workers = spawn_w
+        if auto_workers:
+            p_out(f"{c(CYAN)}[*] Menguji kecepatan CPU & kapasitas RAM VPS (auto worker)...{W}")
+            _bw, _b2t, _bhmax, _bmsg = await _benchmark_vps_capacity(browser_ref[0], hw=hw_info, choose_two_tab=auto_two_tab)
+            start_w = min(_bw, max(1, len(queue)))
+            spawn_w = min(max(1, len(queue)), max(start_w, _bhmax))
+            NUM_CONTEXTS = workers = spawn_w
+            if auto_two_tab:
+                TWO_TAB = _b2t
+            p_out(f"{c(GREEN)}[*] {_bmsg} ✓{W}")
+        else:
+            NUM_CONTEXTS = workers = spawn_w
 
         # Proxy testing & assignment
         proxy_assignments = [None] * NUM_CONTEXTS
