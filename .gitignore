@@ -7,4 +7,5 @@ output/
 *.lock
 .browser_vpn_cache_state.json*
 .ovpn_probe_cache.json*
+.ovpn_node_scores.json*
 *.log

