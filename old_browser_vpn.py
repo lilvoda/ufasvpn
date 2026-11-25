@@ -520,6 +520,7 @@ class _SpeedDetector:
         t = time.monotonic() if now_t is None else now_t
         self.last_check_t = t
         self.pause_until_t = t + 12.0
+        self.peak_rate = 0.0
         self.was_drop = False
         self.samples.clear()
         self.stalls.clear()
@@ -2063,8 +2064,13 @@ class VpnCoordinator:
         self._linux_ssh_preserved = False
         if self.ovpn_dir:
             d_abs = os.path.abspath(self.ovpn_dir)
+            if not os.path.isdir(d_abs) and not os.path.isabs(self.ovpn_dir):
+                cand_base = os.path.join(BASE, self.ovpn_dir)
+                if os.path.isdir(cand_base):
+                    d_abs = os.path.abspath(cand_base)
             if not os.path.isdir(d_abs):
                 raise RuntimeError(f"Folder .ovpn tidak ditemukan: {d_abs}")
+            self.ovpn_dir = d_abs
             self.ovpn_files = sorted(
                 os.path.join(d_abs, f) for f in os.listdir(d_abs)
                 if f.lower().endswith('.ovpn') and os.path.isfile(os.path.join(d_abs, f))
@@ -4399,6 +4405,58 @@ def ask_yn(label: str, default: str = 'y') -> bool:
         if r in ('n', 'no'):
             return False
 
+def _count_ovpn_files(d: str) -> int:
+    if not d or not os.path.isdir(d):
+        return 0
+    return sum(1 for fn in os.listdir(d) if fn.lower().endswith('.ovpn') and os.path.isfile(os.path.join(d, fn)))
+
+def _has_ovpn_auth(d: str) -> bool:
+    return any(os.path.isfile(os.path.join(d, fn)) for fn in ('auth.txt', 'pass.txt', 'credentials.txt'))
+
+def _discover_ovpn_dirs(base_dir: str = BASE) -> list[tuple[str, str, int]]:
+    """Temukan folder berisi *.ovpn (vpns/, vpns/<provider>/, serta subfolder root seperti vpn-proton/)."""
+    out: list[tuple[str, str, int]] = []
+    seen: set[str] = set()
+    skip = {'input', 'output', '__pycache__'}
+    def _add(label: str, path: str):
+        ap = os.path.abspath(path)
+        if ap in seen:
+            return
+        cnt = _count_ovpn_files(ap)
+        if cnt > 0:
+            seen.add(ap)
+            out.append((label, ap, cnt))
+    _add('vpns', os.path.join(base_dir, 'vpns'))
+    try:
+        top_entries = sorted(os.listdir(base_dir))
+    except OSError:
+        top_entries = []
+    for name in top_entries:
+        if name.startswith('.') or name in skip:
+            continue
+        p = os.path.join(base_dir, name)
+        if not os.path.isdir(p):
+            continue
+        if name == 'vpns':
+            try:
+                for sub in sorted(os.listdir(p)):
+                    if not sub.startswith('.'):
+                        _add(f"vpns/{sub}", os.path.join(p, sub))
+            except OSError:
+                pass
+        else:
+            _add(name, p)
+    return out
+
+def _resolve_ovpn_dir_input(raw: str, base_dir: str = BASE) -> str:
+    s = (raw or '').strip().strip('"').strip("'")
+    if not s:
+        return ''
+    if os.path.isabs(s):
+        return s
+    in_base = os.path.join(base_dir, s)
+    return in_base if os.path.isdir(in_base) else os.path.abspath(s)
+
 # ── Main Entrypoint ──────────────────────────────────────────────────────────
 async def async_main():
     pa = argparse.ArgumentParser(description='MLBB Fast Checker v9.0 VPN — Cross-Platform (Termux/Linux/Windows)')
@@ -4469,6 +4527,12 @@ async def async_main():
             })
             _lc = vc._load_probe_cache(ttl_s=21600.0)
             assert 'a.ovpn' in _lc and 'stale.ovpn' not in _lc
+            for _pd in ('vpns', 'vpn-proton', 'vpn-surfshark', 'vpns/hma'):
+                _pdir = os.path.join(_td, *_pd.split('/'))
+                os.makedirs(_pdir, exist_ok=True)
+                open(os.path.join(_pdir, 'node.ovpn'), 'w').write('client\n')
+            _disc = _discover_ovpn_dirs(_td)
+            assert [lbl for lbl, _, _ in _disc] == ['vpns', 'vpn-proton', 'vpn-surfshark', 'vpns/hma'], _disc
         vc.ovpn_dir = ''
         vc.ovpn_failed = True
         try:
@@ -4483,7 +4547,18 @@ async def async_main():
     TWO_TAB = bool(args.two_tab)
 
     if args.test_ovpn_only:
-        ovpn_dir_t = args.vpn_ovpn_dir or (os.path.join(BASE, 'vpns') if os.path.isdir(os.path.join(BASE, 'vpns')) else '')
+        ovpn_dir_t = args.vpn_ovpn_dir
+        if not ovpn_dir_t:
+            _d_list = _discover_ovpn_dirs(BASE)
+            if len(_d_list) > 1 and _IS_TTY:
+                print(f"  {c(CYAN)}Daftar folder OpenVPN:{W}")
+                for idx_d, (lbl_d, path_d, cnt_d) in enumerate(_d_list, 1):
+                    auth_tag = f" {c(GREEN)}auth✓{W}" if _has_ovpn_auth(path_d) else ""
+                    print(f"    {c(WHITE)}[{idx_d}]{W} {lbl_d} {c(GRAY)}({cnt_d} .ovpn){W}{auth_tag}")
+                sel = ask(f"Pilih folder VPN untuk diuji (1-{len(_d_list)} / path)", "1")
+                ovpn_dir_t = _d_list[int(sel) - 1][1] if (sel.isdigit() and 1 <= int(sel) <= len(_d_list)) else _resolve_ovpn_dir_input(sel)
+            elif _d_list:
+                ovpn_dir_t = _d_list[0][1]
         if not ovpn_dir_t:
             p_out(f"{c(RED)}[!] Berikan --vpn-ovpn-dir <folder>{W}")
             return
@@ -4510,14 +4585,8 @@ async def async_main():
     vpn_waf_threshold = max(1, int(args.vpn_waf_threshold))
     vpn_rotate_every = max(0, int(args.vpn_rotate_every))
     vpn_ip_check = not bool(args.no_vpn_ip_check)
-    local_vpns_dir = os.path.join(BASE, 'vpns')
     ovpn_dir = (args.vpn_ovpn_dir or '').strip()
     skip_ovpn_test = bool(args.skip_ovpn_test)
-
-    def _count_ovpn(d: str) -> int:
-        if not d or not os.path.isdir(d):
-            return 0
-        return sum(1 for fn in os.listdir(d) if fn.lower().endswith('.ovpn') and os.path.isfile(os.path.join(d, fn)))
 
     if args.out:
         OUTPUT_DIR = os.path.abspath(args.out) if os.path.isabs(args.out) else os.path.join(BASE, args.out)
@@ -4543,11 +4612,18 @@ async def async_main():
         else:
             PROXY_ENABLED = False
     else:
-        avail_ovpn = _count_ovpn(ovpn_dir or local_vpns_dir)
+        ovpn_dirs = _discover_ovpn_dirs(BASE)
+        if ovpn_dir:
+            _ov_resolved = _resolve_ovpn_dir_input(ovpn_dir)
+            avail_ovpn = _count_ovpn_files(_ov_resolved)
+            _folder_info = f"{avail_ovpn} .ovpn siap"
+        else:
+            avail_ovpn = sum(cnt for _, _, cnt in ovpn_dirs)
+            _folder_info = f"{avail_ovpn} .ovpn · {len(ovpn_dirs)} folder"
         if _IS_TTY:
             os.system("cls" if os.name == "nt" else "clear")
         _sub_hdr = (
-            f"OpenVPN Auto-Rotate ({avail_ovpn} .ovpn siap)" if avail_ovpn > 0
+            f"OpenVPN Auto-Rotate ({_folder_info})" if avail_ovpn > 0
             else "Direct / External VPN Mode"
         )
         _print_box("", [
@@ -4594,16 +4670,38 @@ async def async_main():
             else:
                 PROXY_FILE = os.path.abspath(args.proxy_file)
         if (not PROXY_ENABLED) and not vpn_cmd and not vpn_wait:
-            if not ovpn_dir and avail_ovpn > 0:
-                print(f"  {c(GRAY)}Mode VPN: [1] OpenVPN Auto ({avail_ovpn} .ovpn)  [2] Manual VPN{W}")
+            if not ovpn_dir and ovpn_dirs:
+                print(f"  {c(GRAY)}Mode VPN: [1] OpenVPN Auto ({avail_ovpn} .ovpn, {len(ovpn_dirs)} folder)  [2] Manual VPN{W}")
                 v_mode = ask("Pilih mode jaringan (1-2)", "1")
                 if v_mode == "2":
                     vpn_wait = True
                 else:
-                    ovpn_dir = local_vpns_dir
+                    while True:
+                        print(f"  {c(CYAN)}Daftar folder OpenVPN:{W}")
+                        for idx_d, (lbl_d, path_d, cnt_d) in enumerate(ovpn_dirs, 1):
+                            auth_tag = f" {c(GREEN)}auth✓{W}" if _has_ovpn_auth(path_d) else ""
+                            print(f"    {c(WHITE)}[{idx_d}]{W} {lbl_d} {c(GRAY)}({cnt_d} .ovpn){W}{auth_tag}")
+                        sel = ask(f"Pilih folder VPN (1-{len(ovpn_dirs)} / path)", "1")
+                        if sel.isdigit() and 1 <= int(sel) <= len(ovpn_dirs):
+                            ovpn_dir = ovpn_dirs[int(sel) - 1][1]
+                            break
+                        cand_d = _resolve_ovpn_dir_input(sel)
+                        if _count_ovpn_files(cand_d) > 0:
+                            ovpn_dir = cand_d
+                            break
+                        p_out(f"  {c(RED)}[!] Folder tidak ditemukan atau tidak berisi *.ovpn: {sel}{W}")
             elif not ovpn_dir:
-                p_out(f"  {c(GOLD)}[!] Folder vpns/ kosong -> masuk Mode Manual VPN.{W}")
-                vpn_wait = True
+                p_out(f"  {c(GOLD)}[!] Belum ada folder *.ovpn di {shortpath(BASE)} -> isi path folder atau kosong untuk Manual VPN.{W}")
+                custom_d = ask("Folder .ovpn (kosong = Manual VPN)", "")
+                if custom_d:
+                    cand_d = _resolve_ovpn_dir_input(custom_d)
+                    if _count_ovpn_files(cand_d) > 0:
+                        ovpn_dir = cand_d
+                    else:
+                        p_out(f"  {c(GOLD)}[!] Tidak ada *.ovpn di {custom_d} -> masuk Mode Manual VPN.{W}")
+                        vpn_wait = True
+                else:
+                    vpn_wait = True
             if ovpn_dir:
                 vpn_waf_threshold = 5
                 skip_ovpn_test = False
@@ -4642,7 +4740,7 @@ async def async_main():
         vpn_coord.current_ip = vpn_ip_init
 
     _mode_str = shortpath(PROXY_FILE) if PROXY_ENABLED else (
-        f"OpenVPN auto ({len(vpn_coord.ovpn_files)} .ovpn)" if (vpn_coord and vpn_coord.ovpn_files) else (
+        f"OpenVPN auto ({shortpath(vpn_coord.ovpn_dir)}: {len(vpn_coord.ovpn_files)} .ovpn)" if (vpn_coord and vpn_coord.ovpn_files) else (
             f"{vpn_coord.label()} (cmd)" if vpn_cmd else (f"{vpn_coord.label()} (manual-wait)" if vpn_wait else f"{vpn_coord.label()} (cooldown {int(waf_cooldown)}s)")
         )
     )
