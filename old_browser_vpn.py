@@ -5477,6 +5477,7 @@ async def async_main():
     ovpn_dir = (args.vpn_ovpn_dir or '').strip()
     skip_ovpn_test = bool(args.skip_ovpn_test)
     multi_vpn_slots = 0
+    multi_vpn_auto = False
     multi_vpn_dir = ''
     multi_vpn_sh = ''
     multi_vpn_started = False
@@ -5633,9 +5634,12 @@ async def async_main():
                         elif _miss:
                             p_out(f"  {c(GOLD)}[!] Multi-VPN butuh {', '.join(_miss)} (apt-get install -y openvpn microsocks iptables) -> lanjut OpenVPN tunggal.{W}")
                         else:
-                            _def_sl = str(min(8, max(4, int(hw_info.get('cpus', 4)))))
-                            _sl_in = ask("Jumlah tunnel Multi-VPN (2-16)", _def_sl).strip()
-                            multi_vpn_slots = max(2, min(16, int(_sl_in) if _sl_in.isdigit() else int(_def_sl)))
+                            _sl_in = ask("Jumlah tunnel Multi-VPN (1-20 / auto)", "auto").strip().lower()
+                            if _sl_in in ('', 'auto', 'a'):
+                                multi_vpn_auto = True
+                                multi_vpn_slots = max(1, min(20, workers))
+                            else:
+                                multi_vpn_slots = max(1, min(20, int(_sl_in) if _sl_in.isdigit() else min(8, max(2, workers))))
                             multi_vpn_dir = _resolve_ovpn_dir_input(ovpn_dir)
                             multi_vpn_sh = _pool_sh
                             PROXY_ENABLED = True
@@ -5674,7 +5678,7 @@ async def async_main():
         vpn_ip_init = await fetch_public_ip(timeout_s=4.5)
         vpn_coord.current_ip = vpn_ip_init
 
-    _mode_str = (f"Multi-VPN ({multi_vpn_slots} tunnel -> {shortpath(PROXY_FILE)})" if multi_vpn_slots > 0 else shortpath(PROXY_FILE)) if PROXY_ENABLED else (
+    _mode_str = (f"Multi-VPN ({'auto=sesuai worker' if multi_vpn_auto and auto_workers else f'{multi_vpn_slots} tunnel'} -> {shortpath(PROXY_FILE)})" if multi_vpn_slots > 0 else shortpath(PROXY_FILE)) if PROXY_ENABLED else (
         f"OpenVPN auto ({shortpath(vpn_coord.ovpn_dir)}: {len(vpn_coord.ovpn_files)} .ovpn)" if (vpn_coord and vpn_coord.ovpn_files) else (
             f"{vpn_coord.label()} (cmd)" if vpn_cmd else (f"{vpn_coord.label()} (manual-wait)" if vpn_wait else f"{vpn_coord.label()} (cooldown {int(waf_cooldown)}s)")
         )
@@ -5778,26 +5782,6 @@ async def async_main():
         except RuntimeError as le:
             p_out(f"{c(RED)}[!] {le}{W}")
             return
-        if multi_vpn_slots > 0 and multi_vpn_sh:
-            p_out(f"{c(CYAN)}[*] Menyalakan {multi_vpn_slots} tunnel Multi-VPN ({shortpath(multi_vpn_dir)})...{W}")
-            multi_vpn_started = True
-            _VPNPOOL_CFG.update({'sh': multi_vpn_sh, 'started': True, 'out_file': PROXY_FILE})
-            _vp_proc = await asyncio.create_subprocess_exec(
-                'bash', multi_vpn_sh, 'start', multi_vpn_dir, str(multi_vpn_slots), PROXY_FILE,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-            )
-            try:
-                _vp_out, _ = await asyncio.wait_for(_vp_proc.communicate(), timeout=45.0)
-            except asyncio.TimeoutError:
-                _kill_pid_tree(_vp_proc.pid)
-                p_out(f"{c(RED)}[!] Timeout menyalakan Multi-VPN pool.{W}")
-                return
-            for _vln in (_vp_out or b'').decode('utf-8', errors='ignore').splitlines():
-                if _vln.strip():
-                    p_out(f"  {c(GRAY)}{_vln}{W}")
-            if _vp_proc.returncode != 0:
-                p_out(f"{c(RED)}[!] Multi-VPN gagal dinyalakan -> cek nesting=1 / auth.txt / .ovpn.{W}")
-                return
         if vpn_coord and vpn_coord.ovpn_files:
             if not skip_ovpn_test:
                 good_ovpns = await vpn_coord.probe_ovpns(use_cache=not bool(args.retest_ovpn))
@@ -5824,6 +5808,28 @@ async def async_main():
             p_out(f"{c(GREEN)}[*] {_bmsg} ✓{W}")
         else:
             NUM_CONTEXTS = workers = spawn_w
+        if multi_vpn_slots > 0 and multi_vpn_sh:
+            if multi_vpn_auto:
+                multi_vpn_slots = max(1, min(20, spawn_w))
+            p_out(f"{c(CYAN)}[*] Menyalakan {multi_vpn_slots} tunnel Multi-VPN ({shortpath(multi_vpn_dir)})...{W}")
+            multi_vpn_started = True
+            _VPNPOOL_CFG.update({'sh': multi_vpn_sh, 'started': True, 'out_file': PROXY_FILE})
+            _vp_proc = await asyncio.create_subprocess_exec(
+                'bash', multi_vpn_sh, 'start', multi_vpn_dir, str(multi_vpn_slots), PROXY_FILE,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            )
+            try:
+                _vp_out, _ = await asyncio.wait_for(_vp_proc.communicate(), timeout=45.0)
+            except asyncio.TimeoutError:
+                _kill_pid_tree(_vp_proc.pid)
+                p_out(f"{c(RED)}[!] Timeout menyalakan Multi-VPN pool.{W}")
+                return
+            for _vln in (_vp_out or b'').decode('utf-8', errors='ignore').splitlines():
+                if _vln.strip():
+                    p_out(f"  {c(GRAY)}{_vln}{W}")
+            if _vp_proc.returncode != 0:
+                p_out(f"{c(RED)}[!] Multi-VPN gagal dinyalakan -> cek nesting=1 / auth.txt / .ovpn.{W}")
+                return
         if vpn_coord and vpn_coord.ovpn_files:
             vpn_coord.waf_threshold = max(vpn_coord.waf_threshold, min(16, max(8, start_w)))
 
