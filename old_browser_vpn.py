@@ -22,6 +22,7 @@ import random
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -34,6 +35,7 @@ _popped_cwd = False
 if sys.path and os.path.abspath(sys.path[0]) == _script_dir:
     sys.path.pop(0)
     _popped_cwd = True
+import urllib.error
 import urllib.parse
 import urllib.request
 if _popped_cwd:
@@ -268,13 +270,29 @@ def _kill_ovpn_tree():
 def _emergency_cleanup():
     _kill_driver_tree()
     _kill_ovpn_tree()
-    sh = _VPNPOOL_CFG.get('sh', '') if '_VPNPOOL_CFG' in globals() else ''
-    if sh and _VPNPOOL_CFG.get('started'):
-        _VPNPOOL_CFG['started'] = False
-        try:
-            subprocess.run(['bash', sh, 'stop'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
-        except Exception:
-            pass
+    if '_VPNPOOL_CFG' in globals():
+        sh = _VPNPOOL_CFG.get('sh', '')
+        if sh and _VPNPOOL_CFG.get('started'):
+            _VPNPOOL_CFG['started'] = False
+            try:
+                subprocess.run(['bash', sh, 'stop'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
+            except Exception:
+                pass
+        api_lid = _VPNPOOL_CFG.pop('api_lease_id', '')
+        _VPNPOOL_CFG['api_lease_id'] = ''
+        if api_lid:
+            api_url = _VPNPOOL_CFG.get('api_url', '')
+            api_tok = _VPNPOOL_CFG.get('api_token', '')
+            _VPNPOOL_CFG['api_token'] = ''
+            if isinstance(_VPNPOOL_CFG.get('proxy_urls'), dict):
+                _VPNPOOL_CFG['proxy_urls'].clear()
+            if '_LEASED_PROXIES_MEM' in globals():
+                _LEASED_PROXIES_MEM.clear()
+            if api_url:
+                try:
+                    _gw_api_call_sync(api_url, api_tok, 'POST', '/release', {'lease_id': api_lid}, timeout_s=4.0)
+                except Exception:
+                    pass
     if _LICENSE_SESSION_ACTIVE:
         withdraw_cloak_license()
 
@@ -3777,27 +3795,88 @@ _PROXY_LOAD: dict[str, int] = {}
 def _calc_multi_vpn_slots(workers: int) -> int:
     w = max(1, int(workers))
     return min(45, (w * 3 + 1) // 2)
+_LEASED_PROXIES_MEM: list[str] = []
 _VPNPOOL_CFG: dict = {
     'sh': '', 'started': False, 'out_file': '', 'lock': None,
     'cooldown': {}, 'rotating': set(), 'tasks': set(),
+    'api_url': '', 'api_token': '', 'api_lease_id': '', 'proxy_urls': {},
 }
+
+def _gw_api_call_sync(url: str, token: str, method: str, path: str, payload: dict | None = None, timeout_s: float = 45.0) -> tuple[int, dict]:
+    base = (url or '').strip().rstrip('/')
+    if not base.startswith(('http://', 'https://')):
+        raise ValueError(f"Invalid gateway URL: {url!r}")
+    target = f"{base}{path if path.startswith('/') else '/' + path}"
+    headers = {'Accept': 'application/json'}
+    if token:
+        headers['Authorization'] = f"Bearer {token}"
+    body = None
+    if payload is not None:
+        body = json.dumps(payload).encode('utf-8')
+        headers['Content-Type'] = 'application/json'
+    req = urllib.request.Request(target, data=body, headers=headers, method=method.upper())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            raw = resp.read().decode('utf-8', errors='replace')
+            code = getattr(resp, 'status', 200)
+    except urllib.error.HTTPError as he:
+        code = he.code
+        try:
+            raw = he.read().decode('utf-8', errors='replace')
+        except Exception:
+            raw = ''
+        try:
+            he.close()
+        except Exception:
+            pass
+    try:
+        parsed = json.loads(raw) if raw.strip() else {}
+    except Exception:
+        parsed = {'ok': 200 <= code < 300, 'error': raw[:200]}
+    if not isinstance(parsed, dict):
+        parsed = {'ok': 200 <= code < 300, 'data': parsed}
+    return int(code), parsed
+
+async def _gw_api_call(url: str, token: str, method: str, path: str, payload: dict | None = None, timeout_s: float = 45.0) -> tuple[int, dict]:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _gw_api_call_sync, url, token, method, path, payload, timeout_s)
 
 def _vpnpool_slot_from_proxy(proxy: dict | None) -> int:
     srv = (proxy or {}).get('server', '')
     m = re.match(r'^socks5://10\.200\.(\d+)\.2:1080$', srv)
     return int(m.group(1)) if m else 0
 
+def _is_managed_proxy(proxy: dict | None) -> bool:
+    if not proxy:
+        return False
+    if _vpnpool_slot_from_proxy(proxy) > 0:
+        return True
+    srv = proxy.get('server', '')
+    usr = proxy.get('username') or ''
+    return bool(
+        _VPNPOOL_CFG.get('api_url')
+        and _VPNPOOL_CFG.get('api_lease_id')
+        and (srv, usr) in _VPNPOOL_CFG.get('proxy_urls', {})
+    )
+
 def _maybe_rotate_vpnpool_slot(proxy: dict | None):
-    sh = _VPNPOOL_CFG.get('sh', '')
     srv = (proxy or {}).get('server', '')
+    usr = (proxy or {}).get('username') or ''
     slot = _vpnpool_slot_from_proxy(proxy)
-    if not sh or not _VPNPOOL_CFG.get('started') or slot <= 0:
+    sh = _VPNPOOL_CFG.get('sh', '')
+    is_local = bool(sh and _VPNPOOL_CFG.get('started') and slot > 0)
+    api_url = _VPNPOOL_CFG.get('api_url', '')
+    api_lid = _VPNPOOL_CFG.get('api_lease_id', '')
+    pk = (srv, usr)
+    is_api = bool(api_url and api_lid and pk in _VPNPOOL_CFG.get('proxy_urls', {}))
+    if not (is_local or is_api):
         return
     if srv in _VPNPOOL_CFG['rotating']:
         return
+    cd_key = slot if is_local else srv
     now_t = time.monotonic()
     cd = _VPNPOOL_CFG['cooldown']
-    if now_t < cd.get(slot, 0.0):
+    if now_t < cd.get(cd_key, 0.0):
         return
     _VPNPOOL_CFG['rotating'].add(srv)
 
@@ -3808,13 +3887,33 @@ def _maybe_rotate_vpnpool_slot(proxy: dict | None):
             lk = asyncio.Lock()
             _VPNPOOL_CFG['lock'] = lk
         p = None
+        def _active() -> bool:
+            return bool(_VPNPOOL_CFG.get('api_lease_id') == api_lid) if is_api else bool(_VPNPOOL_CFG.get('started'))
         try:
             # Drain active co-workers briefly before killing this tunnel so in-flight logins aren't cut
             _drain_end = time.monotonic() + 8.0
-            while _PROXY_LOAD.get(srv, 0) > 0 and time.monotonic() < _drain_end and _VPNPOOL_CFG.get('started'):
+            while _PROXY_LOAD.get(srv, 0) > 0 and time.monotonic() < _drain_end and _active():
                 await asyncio.sleep(0.3)
             async with lk:
-                if not _VPNPOOL_CFG.get('started'):
+                if not _active():
+                    return
+                if is_api:
+                    full_raw = _VPNPOOL_CFG['proxy_urls'].get(pk, srv)
+                    port_lbl = srv.rsplit(':', 1)[-1].split('/', 1)[0] if ':' in srv else srv
+                    code, res = await _gw_api_call(
+                        api_url, _VPNPOOL_CFG.get('api_token', ''), 'POST', '/rotate',
+                        {'lease_id': api_lid, 'proxy': full_raw}, timeout_s=45.0,
+                    )
+                    if code == 200 and isinstance(res, dict) and res.get('ok'):
+                        ok_rot = True
+                        _PROXY_FAILS[pk] = 0
+                        if isinstance(res.get('proxy'), str) and res['proxy']:
+                            _VPNPOOL_CFG['proxy_urls'][pk] = res['proxy']
+                        _LIVE_LOGS.append(f" {c(CYAN)}*{W}  {c(CYAN)}API slot #{port_lbl} rotated ✓{W}")
+                    else:
+                        err_r = res.get('error', f'HTTP {code}') if isinstance(res, dict) else f'HTTP {code}'
+                        dbg(f"api rotate slot #{port_lbl} failed ({code}): {err_r}")
+                        _LIVE_LOGS.append(f" {c(GOLD)}!{W}  {c(GOLD)}API slot #{port_lbl} gagal rotasi{W}")
                     return
                 p = await asyncio.create_subprocess_exec(
                     'bash', sh, 'rotate', str(slot),
@@ -3837,7 +3936,6 @@ def _maybe_rotate_vpnpool_slot(proxy: dict | None):
                         in_file = False
                 if p.returncode == 0 and in_file:
                     ok_rot = True
-                    pk = (srv, (proxy or {}).get('username', ''))
                     _PROXY_FAILS[pk] = 0
                     _LIVE_LOGS.append(f" {c(CYAN)}*{W}  {c(CYAN)}VPN Pool slot #{slot} rotated ✓{W}")
                 else:
@@ -3847,9 +3945,9 @@ def _maybe_rotate_vpnpool_slot(proxy: dict | None):
                 _kill_pid_tree(p.pid)
             raise
         except Exception as e:
-            dbg(f"vpnpool rotate slot {slot} err: {e}")
+            dbg(f"vpnpool rotate {cd_key} err: {e}")
         finally:
-            cd[slot] = time.monotonic() + (60.0 if ok_rot else 25.0)
+            cd[cd_key] = time.monotonic() + (60.0 if ok_rot else 25.0)
             _VPNPOOL_CFG['rotating'].discard(srv)
 
     try:
@@ -5258,6 +5356,8 @@ async def async_main():
     pa.add_argument('--proxy-file', type=str, default='')
     pa.add_argument('--no-proxy', action='store_true', default=False)
     pa.add_argument('--vpn-cmd', type=str, default='', help='Perintah shell rotasi VPN otomatis saat WAF/RATE')
+    pa.add_argument('--vpn-api-url', type=str, default='', help='URL gateway API proxy ufasproxy (fallback prompt: UFASPROXY_URL)')
+    pa.add_argument('--vpn-api-token', type=str, default='', help='Bearer token gateway ufasproxy (env: UFASPROXY_TOKEN)')
     pa.add_argument('--vpn-ovpn-dir', type=str, default='', help='Folder berisi file *.ovpn untuk auto-rotate OpenVPN (Windows/Linux)')
     pa.add_argument('--vpn-ovpn-auth', type=str, default='', help='File auth OpenVPN (2 baris: user & pass; default auto-deteksi auth.txt)')
     pa.add_argument('--skip-ovpn-test', action='store_true', help='Lewati pre-test .ovpn ke API Moonton di awal')
@@ -5460,6 +5560,83 @@ async def async_main():
             raise AssertionError("ensure_ovpn_alive must fail when ovpn_failed=True")
         except RuntimeError:
             pass
+        # 7. ufasproxy gateway client integration self-test
+        import http.server as _http_srv
+        _gw_calls = []
+        class _MockGwHandler(_http_srv.BaseHTTPRequestHandler):
+            def log_message(self, fmt, *a): pass
+            def do_POST(self):
+                ln = int(self.headers.get('Content-Length') or 0)
+                raw_b = self.rfile.read(ln).decode('utf-8') if ln > 0 else '{}'
+                _gw_calls.append((self.path, self.headers.get('Authorization', ''), json.loads(raw_b)))
+                if self.path == '/lease':
+                    body_req = _gw_calls[-1][2]
+                    if body_req.get('count') == 99:
+                        resp_c, resp_p = 409, {'ok': False, 'error': 'insufficient capacity'}
+                    else:
+                        resp_c, resp_p = 200, {
+                            'lease_id': 'lease-test-1',
+                            'proxies': [f'http://u1:p1@127.0.0.1:{self.server.server_port}', 'http://u2:p2@127.0.0.1:20002'],
+                            'expires_at': time.time() + 180.0,
+                        }
+                elif self.path == '/heartbeat':
+                    resp_c, resp_p = 200, {'ok': True, 'expires_at': time.time() + 180.0}
+                elif self.path == '/rotate':
+                    resp_c, resp_p = 200, {'ok': True, 'proxy': _gw_calls[-1][2].get('proxy', '')}
+                elif self.path == '/release':
+                    resp_c, resp_p = 200, {'ok': True, 'released': 2}
+                else:
+                    resp_c, resp_p = 404, {'ok': False, 'error': 'not found'}
+                out_b = json.dumps(resp_p).encode('utf-8')
+                self.send_response(resp_c)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(out_b)))
+                self.end_headers()
+                self.wfile.write(out_b)
+        _gw_srv = _http_srv.ThreadingHTTPServer(('127.0.0.1', 0), _MockGwHandler)
+        _gw_thr = threading.Thread(target=_gw_srv.serve_forever, daemon=True)
+        _gw_thr.start()
+        _saved_vpncfg = {k: (v.copy() if isinstance(v, (dict, set)) else v) for k, v in _VPNPOOL_CFG.items()}
+        try:
+            _gw_url = f"http://127.0.0.1:{_gw_srv.server_port}"
+            st409, d409 = await _gw_api_call(_gw_url, 'tok-abc', 'POST', '/lease', {'count': 99})
+            assert st409 == 409 and d409.get('ok') is False
+            st200, d200 = await _gw_api_call(_gw_url, 'tok-abc', 'POST', '/lease', {'count': 2, 'ttl_s': 180, 'client': 'selftest'})
+            assert st200 == 200 and d200['lease_id'] == 'lease-test-1' and len(d200['proxies']) == 2
+            assert _gw_calls[-1][1] == 'Bearer tok-abc'
+            _raw_api_p = d200['proxies'][0]
+            _parsed_api_p = parse_proxy(_raw_api_p)
+            assert _parsed_api_p is not None
+            _VPNPOOL_CFG.update({
+                'api_url': _gw_url, 'api_token': 'tok-abc', 'api_lease_id': 'lease-test-1',
+                'proxy_urls': {(_parsed_api_p['server'], _parsed_api_p['username']): _raw_api_p},
+                'cooldown': {}, 'rotating': set(), 'tasks': set(), 'lock': None,
+            })
+            assert _is_managed_proxy({'server': 'socks5://10.200.4.2:1080'}) is True
+            assert _is_managed_proxy({'server': 'http://1.2.3.4:8080'}) is False
+            assert _is_managed_proxy(_parsed_api_p) is True
+            _pk_api = (_parsed_api_p['server'], _parsed_api_p['username'])
+            _PROXY_FAILS[_pk_api] = 3
+            _maybe_rotate_vpnpool_slot(_parsed_api_p)
+            if _VPNPOOL_CFG['tasks']:
+                await asyncio.gather(*list(_VPNPOOL_CFG['tasks']), return_exceptions=True)
+            assert _PROXY_FAILS.get(_pk_api, -1) == 0
+            assert _parsed_api_p['server'] not in _VPNPOOL_CFG['rotating']
+            assert any('/rotate' == p and b.get('proxy') == _raw_api_p and b.get('lease_id') == 'lease-test-1' for p, _, b in _gw_calls)
+            assert any(f"API slot #{_gw_srv.server_port} rotated" in ln for ln in _LIVE_LOGS)
+            st_hb, d_hb = await _gw_api_call(_gw_url, 'tok-abc', 'POST', '/heartbeat', {'lease_id': 'lease-test-1'})
+            assert st_hb == 200 and d_hb.get('ok') is True
+            _emergency_cleanup()
+            assert _VPNPOOL_CFG.get('api_lease_id', '') == ''
+            _emergency_cleanup()
+            _rel_calls = [c for c in _gw_calls if c[0] == '/release']
+            assert len(_rel_calls) == 1 and _rel_calls[0][2].get('lease_id') == 'lease-test-1'
+        finally:
+            _VPNPOOL_CFG.clear()
+            _VPNPOOL_CFG.update(_saved_vpncfg)
+            _PROXY_FAILS.clear()
+            _gw_srv.shutdown()
+            _gw_srv.server_close()
         print("[✓] All self-tests passed successfully!")
         return
 
@@ -5506,6 +5683,11 @@ async def async_main():
     hw_info = _detect_vps_hw()
     vpn_cmd = args.vpn_cmd
     vpn_wait = bool(args.vpn_wait)
+    vpn_api_url = (args.vpn_api_url or '').strip()
+    if vpn_api_url and '://' not in vpn_api_url:
+        vpn_api_url = 'http://' + vpn_api_url
+    vpn_api_url = vpn_api_url.rstrip('/')
+    vpn_api_token = (args.vpn_api_token or os.environ.get('UFASPROXY_TOKEN', '')).strip()
     waf_cooldown = max(3.0, float(args.waf_cooldown))
     vpn_waf_threshold = max(1, int(args.vpn_waf_threshold))
     vpn_rotate_every = max(0, int(args.vpn_rotate_every))
@@ -5517,9 +5699,11 @@ async def async_main():
     multi_vpn_sh = ''
     multi_vpn_started = False
     _PROXY_LOAD.clear()
+    _LEASED_PROXIES_MEM.clear()
     _VPNPOOL_CFG.update({
         'sh': '', 'started': False, 'out_file': '', 'lock': None,
         'cooldown': {}, 'rotating': set(), 'tasks': set(),
+        'api_url': '', 'api_token': '', 'api_lease_id': '', 'proxy_urls': {},
     })
 
     if args.out:
@@ -5547,6 +5731,8 @@ async def async_main():
                 PROXY_FILE = os.path.join(PROJECT_ROOT, args.proxy_file)
             else:
                 PROXY_FILE = os.path.abspath(args.proxy_file)
+        elif vpn_api_url:
+            PROXY_ENABLED = True
         else:
             PROXY_ENABLED = False
     else:
@@ -5561,8 +5747,10 @@ async def async_main():
         if _IS_TTY:
             os.system("cls" if os.name == "nt" else "clear")
         _sub_hdr = (
-            f"OpenVPN Auto-Rotate ({_folder_info})" if avail_ovpn > 0
-            else "Direct / External VPN Mode"
+            f"API Proxy Server ({vpn_api_url})" if vpn_api_url else (
+                f"OpenVPN Auto-Rotate ({_folder_info})" if avail_ovpn > 0
+                else "Direct / External VPN Mode"
+            )
         )
         _print_box("", [
             f"  {c(WHITE)}{BD}* MLBB FAST CHECKER v9.0 OPENVPN *{W}",
@@ -5621,13 +5809,30 @@ async def async_main():
                 PROXY_FILE = os.path.join(PROJECT_ROOT, args.proxy_file)
             else:
                 PROXY_FILE = os.path.abspath(args.proxy_file)
+        elif vpn_api_url:
+            PROXY_ENABLED = True
+            if not vpn_api_token:
+                vpn_api_token = ask("Bearer token ufasproxy", os.environ.get('UFASPROXY_TOKEN', '')).strip()
         if (not PROXY_ENABLED) and not vpn_cmd and not vpn_wait:
-            if not ovpn_dir and ovpn_dirs:
-                print(f"  {c(GRAY)}Mode VPN: [1] OpenVPN Auto ({avail_ovpn} .ovpn, {len(ovpn_dirs)} folder)  [2] Manual VPN{W}")
-                v_mode = ask("Pilih mode jaringan (1-2)", "1")
-                if v_mode == "2":
-                    vpn_wait = True
+            if not ovpn_dir:
+                if ovpn_dirs:
+                    print(f"  {c(GRAY)}Mode VPN: [1] OpenVPN Auto ({avail_ovpn} .ovpn, {len(ovpn_dirs)} folder)  [2] Manual VPN  [3] API Proxy Server (ufasproxy){W}")
+                    v_mode = ask("Pilih mode jaringan (1-3)", "1").strip()
                 else:
+                    print(f"  {c(GRAY)}Mode VPN: [1] OpenVPN (.ovpn manual)  [2] Manual VPN  [3] API Proxy Server (ufasproxy){W}")
+                    v_mode = ask("Pilih mode jaringan (1-3)", "3" if os.environ.get('UFASPROXY_URL') else "2").strip()
+                if v_mode == "3":
+                    _raw_u = ask("URL gateway ufasproxy (mis. http://IP:8080)", os.environ.get('UFASPROXY_URL', '')).strip()
+                    if _raw_u:
+                        vpn_api_url = (_raw_u if '://' in _raw_u else f'http://{_raw_u}').rstrip('/')
+                        if not vpn_api_token:
+                            vpn_api_token = ask("Bearer token ufasproxy", os.environ.get('UFASPROXY_TOKEN', '')).strip()
+                        PROXY_ENABLED = True
+                    else:
+                        vpn_wait = True
+                elif v_mode == "2":
+                    vpn_wait = True
+                elif ovpn_dirs:
                     while True:
                         print(f"  {c(CYAN)}Daftar folder OpenVPN:{W}")
                         for idx_d, (lbl_d, path_d, cnt_d) in enumerate(ovpn_dirs, 1):
@@ -5646,18 +5851,18 @@ async def async_main():
                             ovpn_dir = cand_d
                             break
                         p_out(f"  {c(RED)}[!] Folder tidak ditemukan atau tidak berisi *.ovpn: {sel}{W}")
-            elif not ovpn_dir:
-                p_out(f"  {c(GOLD)}[!] Belum ada folder *.ovpn di {shortpath(BASE)} -> isi path folder atau kosong untuk Manual VPN.{W}")
-                custom_d = ask("Folder .ovpn (kosong = Manual VPN)", "")
-                if custom_d:
-                    cand_d = _resolve_ovpn_dir_input(custom_d)
-                    if _count_ovpn_files(cand_d) > 0:
-                        ovpn_dir = cand_d
-                    else:
-                        p_out(f"  {c(GOLD)}[!] Tidak ada *.ovpn di {custom_d} -> masuk Mode Manual VPN.{W}")
-                        vpn_wait = True
                 else:
-                    vpn_wait = True
+                    p_out(f"  {c(GOLD)}[!] Belum ada folder *.ovpn di {shortpath(BASE)} -> isi path folder atau kosong untuk Manual VPN.{W}")
+                    custom_d = ask("Folder .ovpn (kosong = Manual VPN)", "")
+                    if custom_d:
+                        cand_d = _resolve_ovpn_dir_input(custom_d)
+                        if _count_ovpn_files(cand_d) > 0:
+                            ovpn_dir = cand_d
+                        else:
+                            p_out(f"  {c(GOLD)}[!] Tidak ada *.ovpn di {custom_d} -> masuk Mode Manual VPN.{W}")
+                            vpn_wait = True
+                    else:
+                        vpn_wait = True
             if ovpn_dir:
                 vpn_waf_threshold = max(8, min(16, workers))
                 skip_ovpn_test = False
@@ -5713,7 +5918,10 @@ async def async_main():
         vpn_ip_init = await fetch_public_ip(timeout_s=4.5)
         vpn_coord.current_ip = vpn_ip_init
 
-    _mode_str = (f"Multi-VPN ({'worker+50% backup' if auto_workers else f'{multi_vpn_slots} tunnel'} -> {shortpath(PROXY_FILE)})" if multi_vpn_slots > 0 else shortpath(PROXY_FILE)) if PROXY_ENABLED else (
+    _mode_str = (
+        f"API Proxy (ufasproxy: {vpn_api_url})" if vpn_api_url else
+        (f"Multi-VPN ({'worker+50% backup' if auto_workers else f'{multi_vpn_slots} tunnel'} -> {shortpath(PROXY_FILE)})" if multi_vpn_slots > 0 else shortpath(PROXY_FILE))
+    ) if PROXY_ENABLED else (
         f"OpenVPN auto ({shortpath(vpn_coord.ovpn_dir)}: {len(vpn_coord.ovpn_files)} .ovpn)" if (vpn_coord and vpn_coord.ovpn_files) else (
             f"{vpn_coord.label()} (cmd)" if vpn_cmd else (f"{vpn_coord.label()} (manual-wait)" if vpn_wait else f"{vpn_coord.label()} (cooldown {int(waf_cooldown)}s)")
         )
@@ -5765,6 +5973,7 @@ async def async_main():
 
     combo_q = _TrackQueue()
     _hb_task = None
+    _api_hb_task = None
     activate_cloak_license(args.license_key)
     p_out(f"{c(CYAN)}[*] Menyiapkan engine browser...{W}")
     browser_ref = [None]
@@ -5872,6 +6081,60 @@ async def async_main():
             if _vp_proc.returncode != 0:
                 p_out(f"{c(RED)}[!] Multi-VPN gagal dinyalakan -> cek nesting=1 / auth.txt / .ovpn.{W}")
                 return
+        if vpn_api_url:
+            need_slots = _calc_multi_vpn_slots(spawn_w)
+            lease_timeout = max(60.0, need_slots * 4.0)
+            p_out(f"{c(CYAN)}[*] Menyewa {need_slots} slot VPN dari ufasproxy ({vpn_api_url})...{W}")
+            try:
+                st_l, res_l = await _gw_api_call(
+                    vpn_api_url, vpn_api_token, 'POST', '/lease',
+                    {'count': need_slots, 'ttl_s': 180, 'client': socket.gethostname()[:32]},
+                    timeout_s=lease_timeout,
+                )
+            except Exception as e_l:
+                p_out(f"{c(RED)}[!] Gagal menghubungi ufasproxy ({vpn_api_url}): {e_l}{W}")
+                return
+            if st_l != 200 or not isinstance(res_l, dict) or not res_l.get('lease_id') or not res_l.get('proxies'):
+                err_l = res_l.get('error', f'HTTP {st_l}') if isinstance(res_l, dict) else f'HTTP {st_l}'
+                hint_l = " (slot penuh / kapasitas habis)" if st_l == 409 else ""
+                p_out(f"{c(RED)}[!] Lease ufasproxy gagal ({st_l}): {err_l}{hint_l}{W}")
+                return
+            api_lease_id = str(res_l['lease_id'])
+            leased_raw = [str(x).strip() for x in res_l['proxies'] if str(x).strip()]
+            _LEASED_PROXIES_MEM[:] = leased_raw
+            _proxy_map = {}
+            for _ru in leased_raw:
+                _pu = parse_proxy(_ru)
+                if _pu:
+                    _proxy_map[(_pu.get('server', ''), _pu.get('username') or '')] = _ru
+            _VPNPOOL_CFG.update({
+                'api_url': vpn_api_url,
+                'api_token': vpn_api_token,
+                'api_lease_id': api_lease_id,
+                'proxy_urls': _proxy_map,
+            })
+            p_out(f"{c(GREEN)}[*] Lease {api_lease_id[:8]}.. aktif ({len(leased_raw)} proxy MT-verified) ✓{W}")
+
+            async def _api_heartbeat_loop():
+                while _VPNPOOL_CFG.get('api_lease_id') == api_lease_id:
+                    await asyncio.sleep(60.0)
+                    if _VPNPOOL_CFG.get('api_lease_id') != api_lease_id:
+                        break
+                    try:
+                        hc, hres = await _gw_api_call(
+                            vpn_api_url, vpn_api_token, 'POST', '/heartbeat',
+                            {'lease_id': api_lease_id}, timeout_s=10.0,
+                        )
+                        if hc == 404:
+                            dbg(f"ufasproxy heartbeat 404 (lease {api_lease_id[:8]} closed)")
+                            break
+                        elif hc != 200:
+                            dbg(f"ufasproxy heartbeat HTTP {hc}: {hres.get('error', '') if isinstance(hres, dict) else ''}")
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as he:
+                        dbg(f"ufasproxy heartbeat err: {he}")
+            _api_hb_task = asyncio.create_task(_api_heartbeat_loop())
         if vpn_coord and vpn_coord.ovpn_files:
             vpn_coord.waf_threshold = max(vpn_coord.waf_threshold, min(16, max(8, start_w)))
 
@@ -5879,9 +6142,13 @@ async def async_main():
         proxy_assignments = [None] * NUM_CONTEXTS
         live_pool = None
         if PROXY_ENABLED:
-            raw_p = load_proxies(PROXY_FILE)
+            raw_p = list(_LEASED_PROXIES_MEM) if vpn_api_url else load_proxies(PROXY_FILE)
             if not raw_p:
-                p_out(f"\n  {c(RED)}{BD}[!] File proxy kosong atau tidak ditemukan: {PROXY_FILE}{W}")
+                _empty_msg = (
+                    "Gateway ufasproxy tidak mengembalikan proxy aktif"
+                    if vpn_api_url else f"File proxy kosong atau tidak ditemukan: {PROXY_FILE}"
+                )
+                p_out(f"\n  {c(RED)}{BD}[!] {_empty_msg}{W}")
                 p_out(f"  {c(GRAY)}Eksekusi dibatalkan otomatis untuk melindungi IP asli kamu.{W}\n")
                 return
             p_out(f"{c(CYAN)}[*] Menguji ping proxy ke API Moonton ({len(raw_p)} proxy)...{W}")
@@ -5905,7 +6172,10 @@ async def async_main():
         _PERF.configure_workers(min_w=min(2, spawn_w), start_w=start_w, max_w=spawn_w, auto_scale=True)
         stats['workers_total'] = spawn_w
         stats['workers'] = _PERF.target_workers
-        stats['proxy_label'] = f"{os.path.basename(PROXY_FILE)} ({len(live_pool or [])} live)" if PROXY_ENABLED else vpn_coord.label()
+        stats['proxy_label'] = (
+            f"ufasproxy ({len(live_pool or [])} live)" if vpn_api_url
+            else (f"{os.path.basename(PROXY_FILE)} ({len(live_pool or [])} live)" if PROXY_ENABLED else vpn_coord.label())
+        )
         _TUI_ACTIVE = bool(_IS_TTY and (_TERM != 'dumb') and _COLOR_OK)
         if _TUI_ACTIVE:
             sys.stdout.write("\033[?1049h\033[?25l\033[2J\033[H")
@@ -6095,6 +6365,12 @@ async def async_main():
                 await _hb_task
             except BaseException:
                 pass
+        if _api_hb_task is not None:
+            _api_hb_task.cancel()
+            try:
+                await _api_hb_task
+            except BaseException:
+                pass
         if _CACHE_DIRTY:
             _save_static_cache()
         if _TUI_ACTIVE:
@@ -6124,15 +6400,28 @@ async def async_main():
         if _LICENSE_SESSION_ACTIVE:
             withdraw_cloak_license()
             p_out(f"{c(GRAY)}[*] License key CloakBrowser ditarik dari device ✓{W}")
+        _VPNPOOL_CFG['started'] = False
+        _VPNPOOL_CFG['sh'] = ''
+        _lid_rel = _VPNPOOL_CFG.pop('api_lease_id', '')
+        _VPNPOOL_CFG['api_lease_id'] = ''
+        _rot_tasks = list(_VPNPOOL_CFG['tasks'])
+        for _rt in _rot_tasks:
+            if not _rt.done():
+                _rt.cancel()
+        if _rot_tasks:
+            await asyncio.gather(*_rot_tasks, return_exceptions=True)
+        if _lid_rel:
+            _url_rel = _VPNPOOL_CFG.get('api_url', '')
+            _tok_rel = _VPNPOOL_CFG.get('api_token', '')
+            _VPNPOOL_CFG['api_token'] = ''
+            _VPNPOOL_CFG['proxy_urls'].clear()
+            _LEASED_PROXIES_MEM.clear()
+            if _url_rel:
+                try:
+                    await _gw_api_call(_url_rel, _tok_rel, 'POST', '/release', {'lease_id': _lid_rel}, timeout_s=8.0)
+                except BaseException:
+                    pass
         if multi_vpn_started and multi_vpn_sh:
-            _VPNPOOL_CFG['started'] = False
-            _VPNPOOL_CFG['sh'] = ''
-            _rot_tasks = list(_VPNPOOL_CFG['tasks'])
-            for _rt in _rot_tasks:
-                if not _rt.done():
-                    _rt.cancel()
-            if _rot_tasks:
-                await asyncio.gather(*_rot_tasks, return_exceptions=True)
             _sp = None
             try:
                 _sp = await asyncio.create_subprocess_exec(
