@@ -744,21 +744,22 @@ class SmartController:
         return True, tag, cur_r, peak_r
 
     def decide_action(self, avail_mb: float, can_rotate_vpn: bool, ctx_age: int,
-                      is_recycling: bool, now_t: float | None = None) -> tuple[str, dict]:
+                      is_recycling: bool, now_t: float | None = None,
+                      ram_floor_mb: float = 360.0) -> tuple[str, dict]:
         """Satu keputusan terpusat per tick: SCALE_DOWN / RECYCLE_BROWSER / ROTATE_VPN / SCALE_UP / NONE."""
         t = time.monotonic() if now_t is None else now_t
         is_drop, tag, _, _, cur_r, peak_r = self.evaluate(t)
         n_out, waf_r, tmo_r, lock_r = self._window_ratios(t)
 
         # 1. Tekanan RAM kritis harus membatalkan probe & menahan burst scale-down tiap 10s
-        ram_crit = avail_mb > 0 and avail_mb < 360.0
+        ram_crit = avail_mb > 0 and avail_mb < ram_floor_mb
         if ram_crit:
             self.probe_active = None
         if self.probe_active is not None:
             base_r, p_t0, prev_w = self.probe_active
             if (t - p_t0) >= 12.0:
                 self.probe_active = None
-                if cur_r > base_r * 1.03 and lock_r < 0.25 and (avail_mb <= 0 or avail_mb >= 400.0):
+                if cur_r > base_r * 1.03 and lock_r < 0.25 and (avail_mb <= 0 or avail_mb >= ram_floor_mb + 60.0):
                     self.last_up_ok_t = t
                 else:
                     self.scale_up_cooldown_t = t + 60.0
@@ -803,7 +804,7 @@ class SmartController:
             and t >= self.scale_up_cooldown_t
             and (t - self.last_scale_t) >= 25.0
             and waf_r < 0.12 and tmo_r < 0.08 and lock_r < 0.12
-            and (avail_mb <= 0 or avail_mb >= 650.0)
+            and (avail_mb <= 0 or avail_mb >= ram_floor_mb + 290.0)
         ):
             self.probe_active = (max(cur_r, 0.2), t, self.target_workers)
             return 'SCALE_UP', {'new_w': self.target_workers + 1, 'cur_r': cur_r}
@@ -4895,6 +4896,7 @@ def _detect_vps_hw() -> dict:
     cpus = float(os.cpu_count() or 2)
     avail_mb = 2048.0
     total_mb = 2048.0
+    swap_mb = 2048.0 if os.name == 'nt' else 0.0
     if os.name == 'nt':
         try:
             import ctypes
@@ -4925,6 +4927,7 @@ def _detect_vps_hw() -> dict:
                 if mi.get('MemTotal'):
                     total_mb = mi['MemTotal']
                 avail_mb = mi.get('MemAvailable') or (mi.get('MemFree', 0) + mi.get('Buffers', 0) + mi.get('Cached', 0)) or total_mb
+                swap_mb = mi.get('SwapTotal', 0.0)
         except Exception:
             pass
         # Hormati limit cgroup (Proxmox LXC / Docker) bila lebih kecil dari /proc
@@ -4957,12 +4960,13 @@ def _detect_vps_hw() -> dict:
                     cpus = min(cpus, max(0.5, q / p))
         except Exception:
             pass
-    ram_cap = max(1, int(max(0.0, avail_mb - 450.0) / 160.0))
+    no_swap = (os.name != 'nt' and swap_mb < 64.0)
+    ram_cap = max(1, int(max(0.0, avail_mb - (600.0 if no_swap else 450.0)) / (185.0 if no_swap else 160.0)))
     cpu_cap = max(2, int(round(cpus * 2.5)))
     hw_max = max(1, min(24, ram_cap, cpu_cap))
     if _PLAT['is_android']:
         hw_max = min(hw_max, 6)
-    return {'cpus': round(cpus, 1), 'total_mb': int(total_mb), 'avail_mb': int(avail_mb), 'hw_max': hw_max}
+    return {'cpus': round(cpus, 1), 'total_mb': int(total_mb), 'avail_mb': int(avail_mb), 'hw_max': hw_max, 'no_swap': no_swap}
 
 def _read_linux_cpu_ticks() -> tuple[int, int] | None:
     """Baca (total_ticks, steal_ticks) dari /proc/stat Linux untuk deteksi VPS oversubscribed."""
@@ -4979,51 +4983,56 @@ def _read_linux_cpu_ticks() -> tuple[int, int] | None:
         pass
     return None
 
-def _calc_auto_safe_cap(cpus: float, avail_mb: float, t1_s: float, steal_pct: float = 0.0) -> int:
-    """Hitung batas worker aman berbasis kecepatan single-core nyata (V8/Chromium), steal CPU, & RAM."""
-    ram_cap = max(1, int(max(0.0, avail_mb - 450.0) / 160.0)) if avail_mb > 0 else 8
-    if steal_pct >= 12.0 or t1_s >= 0.30:
-        mult = 1.25  # Xeon lambat / host oversubscribed
-    elif steal_pct >= 5.0 or t1_s >= 0.18:
-        mult = 1.75
+def _calc_auto_safe_cap(cpus: float, avail_mb: float, t1_js_ms: float, steal_pct: float = 0.0, no_swap: bool = False) -> int:
+    """Hitung batas worker aman berbasis kecepatan pure V8+DOM nyata (ms), CPU steal, & RAM tanpa swap."""
+    res_mb, per_ctx_mb = (600.0, 185.0) if no_swap else (450.0, 160.0)
+    ram_cap = max(1, int(max(0.0, avail_mb - res_mb) / per_ctx_mb)) if avail_mb > 0 else 8
+    if steal_pct >= 10.0 or t1_js_ms >= 250.0:
+        mult = 1.0   # DO / Xeon lambat atau host oversubscribed
+    elif steal_pct >= 4.0 or t1_js_ms >= 175.0:
+        mult = 1.5
     else:
-        mult = 2.5   # CPU modern cepat
+        mult = 2.5   # EPYC / Ryzen modern
     cap = max(2, int(round(cpus * mult)))
     if _PLAT['is_android']:
         cap = min(cap, 6)
     return max(1, min(24, ram_cap, cap))
 
 async def _benchmark_vps_capacity(browser, hw: dict | None = None, choose_two_tab: bool = True) -> tuple[int, bool, int, str]:
-    """Benchmark Chromium nyata (tanpa fake sleep) untuk deteksi kekuatan CPU single-core, steal, & saturation knee."""
+    """Benchmark Chromium nyata (pure V8+DOM compute tanpa sleep) + Linux steal + anti-OOM DO."""
     hw = hw or _detect_vps_hw()
     cpus = max(0.5, float(hw['cpus']))
     avail_mb = float(hw['avail_mb'])
+    no_swap = bool(hw.get('no_swap', False))
     if browser is None:
         fallback_n = min(4, max(1, int(hw['hw_max'])))
         return fallback_n, False, fallback_n, f"Estimasi CPU/RAM: {cpus} vCPU · {avail_mb/1024:.1f} GB RAM -> {fallback_n}w"
 
     _WORK_JS = (
         "() => {"
+        " const t0 = performance.now();"
         " const f = document.createElement('div');"
         " f.innerHTML = '<input type=\"text\"><input type=\"password\"><button>OK</button>';"
         " document.body.appendChild(f);"
-        " let h = 2166136261;"
-        " for (let i = 0; i < 650000; i++) {"
-        "   h = Math.imul(h ^ (i & 255), 16777619);"
-        "   if ((i & 16383) === 0) f.firstChild.value = String(h);"
+        " let h = 2166136261, s = 'mlbb';"
+        " for (let i = 0; i < 1200; i++) {"
+        "   f.firstChild.value = String(i);"
+        "   void f.offsetHeight;"
+        "   s = btoa(s.slice(0, 16) + (h & 255));"
+        "   for (let j = 0; j < 400; j++) h = Math.imul(h ^ ((i + j) & 255), 16777619);"
         " }"
-        " return h;"
+        " return performance.now() - t0;"
         "}"
     )
 
-    async def _one_probe() -> float:
+    async def _one_probe() -> tuple[float, float]:
         c_tmp = None
         t_s = time.perf_counter()
         try:
             c_tmp = await asyncio.wait_for(browser.new_context(), timeout=8.0)
             p_tmp = await asyncio.wait_for(c_tmp.new_page(), timeout=6.0)
-            await asyncio.wait_for(p_tmp.evaluate(_WORK_JS), timeout=6.0)
-            return time.perf_counter() - t_s
+            js_ms = float(await asyncio.wait_for(p_tmp.evaluate(_WORK_JS), timeout=6.0) or 0.0)
+            return time.perf_counter() - t_s, js_ms
         finally:
             if c_tmp is not None:
                 try:
@@ -5031,23 +5040,25 @@ async def _benchmark_vps_capacity(browser, hw: dict | None = None, choose_two_ta
                 except Exception:
                     pass
 
-    # Warmup 1 context agar JIT/binary cache hangat, lalu ukur baseline single-context t1 nyata
-    t1 = 0.25
+    # Warmup context & ukur baseline single-context (wall + pure V8/DOM ms)
+    t1, t1_js = 0.45, 220.0
     try:
-        t1 = await _one_probe()
-        t1_b = await _one_probe()
-        t1 = max(0.05, min(t1, t1_b))
+        dt_a, js_a = await _one_probe()
+        dt_b, js_b = await _one_probe()
+        t1 = max(0.08, min(dt_a, dt_b))
+        t1_js = max(20.0, min(js_a, js_b))
     except Exception:
         pass
 
-    safe_cap = _calc_auto_safe_cap(cpus, avail_mb, t1, steal_pct=0.0)
+    safe_cap = _calc_auto_safe_cap(cpus, avail_mb, t1_js, steal_pct=0.0, no_swap=no_swap)
     levels = sorted({v for v in (2, 4, 6, 8, 10, 12, 16, 20, safe_cap) if 2 <= v <= safe_cap})
     if not levels:
         levels = [1]
 
     best_n = 1
-    best_tp = 1.0 / max(t1, 0.05)
+    best_tp = 1.0 / max(t1, 0.08)
     last_steal = 0.0
+    ram_stop_mb = 520 if no_swap else 380
 
     for n in levels:
         st0 = _read_linux_cpu_ticks()
@@ -5057,32 +5068,34 @@ async def _benchmark_vps_capacity(browser, hw: dict | None = None, choose_two_ta
         st1 = _read_linux_cpu_ticks()
         if st0 and st1 and st1[0] > st0[0]:
             last_steal = max(0.0, (st1[1] - st0[1]) * 100.0 / (st1[0] - st0[0]))
-            safe_cap = min(safe_cap, _calc_auto_safe_cap(cpus, avail_mb, t1, steal_pct=last_steal))
+            safe_cap = min(safe_cap, _calc_auto_safe_cap(cpus, avail_mb, t1_js, steal_pct=last_steal, no_swap=no_swap))
             if n > safe_cap:
                 break
-        ok_cnt = sum(1 for r in res if not isinstance(r, BaseException))
-        if ok_cnt < n:
+        ok_res = [r for r in res if not isinstance(r, BaseException)]
+        if len(ok_res) < n:
             break
-        tp = ok_cnt / dt
-        # Hentikan begitu latensi melebar >2.35x single-context baseline atau throughput tak lagi naik signifikan (+15%)
-        if dt > max(0.45, t1 * 2.35):
+        max_js = max((r[1] for r in ok_res), default=t1_js)
+        tp = len(ok_res) / dt
+        if dt > max(0.55, t1 * 2.2) or max_js > max(260.0, t1_js * 2.0):
             break
         if tp < best_tp * 1.15:
             break
-        if last_steal >= 12.0:
+        if last_steal >= 10.0:
             break
-        if _detect_vps_hw()['avail_mb'] < 380:
+        if _detect_vps_hw()['avail_mb'] < ram_stop_mb:
             break
         best_n, best_tp = n, tp
 
-    headroom_max = min(safe_cap, best_n + (2 if safe_cap > best_n else 0))
-    # 2-tab hanya menguntungkan bila CPU single-core cepat (t1 <= 0.22s) dan RAM longgar
-    two_t = bool(choose_two_tab and best_n <= 4 and t1 <= 0.22 and last_steal < 5.0 and avail_mb >= 1024)
+    slow_host = t1_js >= 240.0 or last_steal >= 8.0 or no_swap
+    headroom_max = min(safe_cap, best_n + (1 if (safe_cap > best_n and slow_host) else (2 if safe_cap > best_n else 0)))
+    # 2-tab hanya bila CPU cepat & RAM cukup longgar
+    two_t = bool(choose_two_tab and best_n <= 4 and t1_js <= 175.0 and last_steal < 4.0 and avail_mb >= 1200)
     steal_str = f" steal:{last_steal:.0f}%" if last_steal >= 1.0 else ""
-    tier = "lambat/oversub" if t1 >= 0.30 or last_steal >= 10.0 else ("sedang" if t1 >= 0.18 else "cepat")
+    tier = "lambat/oversub" if (t1_js >= 250.0 or last_steal >= 10.0) else ("sedang" if t1_js >= 175.0 else "cepat")
+    swap_str = " no-swap" if no_swap else ""
     summary = (
-        f"Auto Worker: CPU {cpus} vCPU ({tier}, 1-ctx {int(t1*1000)}ms{steal_str}) · "
-        f"{avail_mb/1024:.1f}GB free -> {best_n} ctx x {2 if two_t else 1} tab (max {headroom_max}w)"
+        f"Auto Worker: {cpus} vCPU ({tier}, V8:{int(t1_js)}ms{steal_str}) · "
+        f"{avail_mb/1024:.1f}GB{swap_str} -> {best_n} ctx x {2 if two_t else 1} tab (max {headroom_max}w)"
     )
     return best_n, two_t, headroom_max, summary
 
@@ -5193,20 +5206,20 @@ async def async_main():
         assert sd_t.should_auto_heal(now_t=161.0)[0]
         _hw = _detect_vps_hw()
         assert _hw['cpus'] > 0 and _hw['total_mb'] > 0
-        # Uji akurat CPU cap: Xeon abal2 (t1=0.38s) harus dibatasi jauh lebih rendah daripada CPU cepat (t1=0.10s)
-        assert _calc_auto_safe_cap(4.0, 8192.0, 0.38, steal_pct=0.0) <= 5
-        assert _calc_auto_safe_cap(4.0, 8192.0, 0.10, steal_pct=15.0) <= 5
-        assert _calc_auto_safe_cap(4.0, 8192.0, 0.10, steal_pct=0.0) == 10
+        # Uji akurat CPU/RAM DO: Xeon lambat (t1_js=310ms) atau steal >=10% dibatasi <=4 worker di 4 vCPU
+        assert _calc_auto_safe_cap(4.0, 2200.0, 310.0, steal_pct=0.0, no_swap=True) <= 4
+        assert _calc_auto_safe_cap(4.0, 8192.0, 120.0, steal_pct=12.0) <= 4
+        assert _calc_auto_safe_cap(4.0, 8192.0, 120.0, steal_pct=0.0) == 10
         class _FakePage:
             async def evaluate(self, js):
                 await asyncio.sleep(0.02)
-                return 1
+                return 120.0
         class _FakeCtx:
             async def new_page(self): return _FakePage()
             async def close(self): return None
         class _FakeBrowser:
             async def new_context(self): return _FakeCtx()
-        _bw, _b2t, _bhmax, _bmsg = await _benchmark_vps_capacity(_FakeBrowser(), hw={'cpus': 4.0, 'total_mb': 8192, 'avail_mb': 6000, 'hw_max': 10}, choose_two_tab=True)
+        _bw, _b2t, _bhmax, _bmsg = await _benchmark_vps_capacity(_FakeBrowser(), hw={'cpus': 4.0, 'total_mb': 8192, 'avail_mb': 6000, 'hw_max': 10, 'no_swap': False}, choose_two_tab=True)
         assert 1 <= _bw <= _bhmax <= 10 and 'Auto Worker:' in _bmsg
         # 6. Unified SmartController brain (AIMD scaling, adaptive timeout, plateau calibration, node reputation)
         sc = SmartController()
@@ -5686,10 +5699,12 @@ async def async_main():
                     continue
                 if vpn_coord is not None and (vpn_coord.ovpn_failed or vpn_coord.rotating):
                     continue
-                avail_mb = _detect_vps_hw().get('avail_mb', 0.0)
+                _hw_now = _detect_vps_hw()
+                avail_mb = _hw_now.get('avail_mb', 0.0)
+                _ram_floor = 450.0 if _hw_now.get('no_swap') else 360.0
                 can_rot = vpn_coord is not None and (len(vpn_coord.ovpn_files) > 1 or bool(vpn_coord.vpn_cmd))
                 ctx_age = stats['proxy_ctx'] - browser_state['born_ctx']
-                act, info = _PERF.decide_action(avail_mb, can_rot, ctx_age, browser_state['recycling'])
+                act, info = _PERF.decide_action(avail_mb, can_rot, ctx_age, browser_state['recycling'], ram_floor_mb=_ram_floor)
                 if act == 'NONE':
                     continue
                 _PERF.last_action_t = time.monotonic()
