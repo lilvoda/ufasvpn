@@ -2060,6 +2060,7 @@ class VpnCoordinator:
         self.ovpn_ignore_dns_block = False
         self.ovpn_started = False
         self.ovpn_failed = False
+        self._linux_ssh_preserved = False
         if self.ovpn_dir:
             d_abs = os.path.abspath(self.ovpn_dir)
             if not os.path.isdir(d_abs):
@@ -2089,6 +2090,71 @@ class VpnCoordinator:
         self.lock = asyncio.Lock()
         self.gate = asyncio.Event()
         self.gate.set()
+
+    @staticmethod
+    def _parse_linux_default_route(route_out: str) -> tuple[str, str]:
+        """Ekstrak (dev, gw) rute default non-tunnel Linux untuk policy routing anti putus SSH."""
+        for ln in (route_out or '').splitlines():
+            parts = ln.split()
+            if not parts or parts[0] != 'default':
+                continue
+            dev = parts[parts.index('dev') + 1] if 'dev' in parts and parts.index('dev') + 1 < len(parts) else ''
+            gw = parts[parts.index('via') + 1] if 'via' in parts and parts.index('via') + 1 < len(parts) else ''
+            if dev and not dev.startswith(('tun', 'tap')):
+                return dev, gw
+        return '', ''
+
+    async def _preserve_linux_vps_routes(self):
+        """Pasang policy routing (table 100) agar SSH/incoming ke IP asli VPS tetap hidup saat OpenVPN mengubah default route."""
+        if os.name == 'nt' or not sys.platform.startswith('linux') or self._linux_ssh_preserved:
+            return
+        ip_bin = shutil.which('ip') or ('/sbin/ip' if os.path.isfile('/sbin/ip') else '/usr/sbin/ip')
+        if not ip_bin or not os.path.isfile(ip_bin):
+            return
+        self._linux_ssh_preserved = True
+
+        async def _run_ip(*args: str) -> tuple[int, str]:
+            proc = await asyncio.create_subprocess_exec(
+                ip_bin, *args,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            out_b, _ = await asyncio.wait_for(proc.communicate(), timeout=4.0)
+            return proc.returncode, (out_b or b'').decode('utf-8', errors='ignore')
+
+        try:
+            rc, rt_out = await _run_ip('-4', 'route', 'show', 'default')
+            if rc != 0:
+                return
+            dev, gw = self._parse_linux_default_route(rt_out)
+            if not dev:
+                return
+            rc_a, addr_out = await _run_ip('-4', '-o', 'addr', 'show', 'dev', dev, 'scope', 'global')
+            if rc_a != 0:
+                return
+            ips = []
+            for ln in addr_out.splitlines():
+                m = re.search(r'\binet\s+(\d+\.\d+\.\d+\.\d+)/', ln)
+                if m and m.group(1) not in ips:
+                    ips.append(m.group(1))
+            if not ips:
+                return
+            await _run_ip('route', 'flush', 'table', '100')
+            _, link_out = await _run_ip('-4', 'route', 'show', 'dev', dev, 'scope', 'link')
+            for ln in link_out.splitlines():
+                net_dst = ln.split()[0] if ln.split() else ''
+                if net_dst and net_dst != 'default':
+                    await _run_ip('route', 'replace', net_dst, 'dev', dev, 'scope', 'link', 'table', '100')
+            if gw:
+                await _run_ip('route', 'replace', 'default', 'via', gw, 'dev', dev, 'onlink', 'table', '100')
+            else:
+                await _run_ip('route', 'replace', 'default', 'dev', dev, 'table', '100')
+            for ip_addr in ips:
+                await _run_ip('rule', 'del', 'from', f'{ip_addr}/32', 'table', '100')
+                rc_r, _ = await _run_ip('rule', 'add', 'from', f'{ip_addr}/32', 'table', '100', 'priority', '100')
+                if rc_r == 0:
+                    p_out(f"{c(GRAY)}[*] Policy route VPS/SSH aktif: {ip_addr} -> {dev} (table 100) ✓{W}")
+        except Exception as exc:
+            dbg(f"preserve_linux_vps_routes note: {exc}")
 
     async def _cleanup_win_ovpn_state(self):
         """Bersihkan sisa IP/route OpenVPN yang tertinggal jika proses sebelumnya ter-kill paksa."""
@@ -2360,6 +2426,7 @@ class VpnCoordinator:
             except Exception:
                 pass
         await self._ensure_warp_off()
+        await self._preserve_linux_vps_routes()
         await self._cleanup_win_ovpn_state()
         total = len(self.ovpn_files)
         cache = self._load_probe_cache(cache_ttl_s) if use_cache else {}
@@ -2496,6 +2563,7 @@ class VpnCoordinator:
         if not self.ovpn_files:
             return True
         await self._ensure_warp_off()
+        await self._preserve_linux_vps_routes()
         await self._cleanup_win_ovpn_state()
         if not _TUI_ACTIVE:
             p_out(f"{c(CYAN)}[*] Menghubungkan OpenVPN tercepat ({os.path.basename(self.ovpn_files[0])})...{W}")
@@ -4365,6 +4433,7 @@ async def async_main():
         assert vc.consec_waf_rate == 0 and vc.label() == 'VPN · Direct' and not vc.ovpn_started
         linux_cmd = vc._build_ovpn_cmd('/tmp/test.ovpn', 12345, is_win=False)
         assert linux_cmd.index('--ignore-unknown-option') < linux_cmd.index('--config')
+        assert vc._parse_linux_default_route("default via 10.0.0.1 dev tun0\ndefault via 192.168.1.1 dev eth0 proto static\n") == ('eth0', '192.168.1.1')
         import tempfile
         with tempfile.TemporaryDirectory() as _td:
             vc.ovpn_dir = _td
