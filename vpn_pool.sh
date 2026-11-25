@@ -120,6 +120,7 @@ wait_slots() {
         fi
     done
     echo "[*] Aktif: $ok/$n tunnel -> $out_file"
+    [ "$ok" -gt 0 ]
 }
 
 cmd_start() {

