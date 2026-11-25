@@ -521,7 +521,6 @@ class SmartController:
         self.last_action_t = 0.0
         self.last_scale_t = t
         self.scale_up_cooldown_t = t + 20.0
-        self.probe_active: tuple[float, float, int] | None = None  # (base_rate, start_t, prev_w)
         self.min_workers = 1
         self.target_workers = 1
         self.max_workers = 1
@@ -551,7 +550,6 @@ class SmartController:
         self.auto_scale = bool(auto_scale)
         self.last_scale_t = t
         self.scale_up_cooldown_t = t + 20.0
-        self.probe_active = None
         self.smart_note = f"{self.target_workers}/{self.max_workers}w"
 
     def live_workers(self) -> int:
@@ -629,7 +627,6 @@ class SmartController:
         self.peak_rate = 0.0
         self.drop_since_t = 0.0
         self.was_drop = False
-        self.probe_active = None
         self.samples.clear()
         self.stalls.clear()
         self.outcomes.clear()
@@ -746,48 +743,24 @@ class SmartController:
     def decide_action(self, avail_mb: float, can_rotate_vpn: bool, ctx_age: int,
                       is_recycling: bool, now_t: float | None = None,
                       ram_floor_mb: float = 360.0) -> tuple[str, dict]:
-        """Satu keputusan terpusat per tick: SCALE_DOWN / RECYCLE_BROWSER / ROTATE_VPN / SCALE_UP / NONE."""
+        """Satu keputusan terpusat per tick: RECYCLE_BROWSER / ROTATE_VPN / SCALE_UP / NONE."""
         t = time.monotonic() if now_t is None else now_t
         is_drop, tag, _, _, cur_r, peak_r = self.evaluate(t)
         n_out, waf_r, tmo_r, lock_r = self._window_ratios(t)
 
-        # 1. Tekanan RAM kritis harus membatalkan probe & menahan burst scale-down tiap 10s
-        ram_crit = avail_mb > 0 and avail_mb < ram_floor_mb
-        if ram_crit:
-            self.probe_active = None
-        if self.probe_active is not None:
-            base_r, p_t0, prev_w = self.probe_active
-            if (t - p_t0) >= 12.0:
-                self.probe_active = None
-                if cur_r > base_r * 1.03 and lock_r < 0.25 and (avail_mb <= 0 or avail_mb >= ram_floor_mb + 60.0):
-                    self.last_up_ok_t = t
-                else:
-                    self.scale_up_cooldown_t = t + 60.0
-                    return 'SCALE_DOWN', {'new_w': prev_w, 'reason': f'probe flat ({cur_r:.2f} vs {base_r:.2f}/s)'}
-
-        # Global cooldown antar aksi berat (lebih responsif saat RAM kritis)
-        if (t - self.last_action_t) < (4.0 if ram_crit else 6.0):
+        # Global cooldown antar aksi berat
+        if (t - self.last_action_t) < 6.0:
             return 'NONE', {}
-
-        # 2. Tekanan RAM, kontensi LOCK, atau WAF burst di 1-IP VPN -> turunkan worker bertahap dulu sebelum rotasi VPN
-        lock_heavy = (tag == 'LOCK' and is_drop and lock_r >= 0.40) or (lock_r >= 0.55 and is_drop)
-        waf_heavy = can_rotate_vpn and n_out >= 10 and waf_r >= 0.35 and self.target_workers > max(self.min_workers, 6)
-        if (ram_crit or lock_heavy or waf_heavy) and self.target_workers > self.min_workers and (t - self.last_scale_t) >= (10.0 if ram_crit else 18.0):
-            step = max(1, self.target_workers // 4)
-            new_w = max(self.min_workers, self.target_workers - step)
-            why = f"RAM {int(avail_mb)}MB" if ram_crit else (f"LOCK {int(lock_r*100)}%" if lock_heavy else f"WAF {int(waf_r*100)}%")
-            return 'SCALE_DOWN', {'new_w': new_w, 'reason': why}
 
         if not is_recycling and (
             (tag == 'LOCK' and is_drop and (t - self.last_heal_t) >= 25.0)
             or (ctx_age >= max(400, self.target_workers * 35) and (t - self.last_heal_t) >= 45.0)
         ):
             if (t - self.pause_until_t) >= 8.0:
-                self.probe_active = None
                 self.scale_up_cooldown_t = max(self.scale_up_cooldown_t, t + 25.0)
                 return 'RECYCLE_BROWSER', {'cur_r': cur_r, 'peak_r': peak_r, 'reason': tag if is_drop else 'ctx_age'}
 
-        # 3. Degradasi VPN / WAF berat setelah cukup sampel -> rotasi VPN (hindari rotasi tiap 40s)
+        # Degradasi VPN / WAF berat setelah cukup sampel -> rotasi VPN (hindari rotasi tiap 40s)
         if can_rotate_vpn and (t - self.pause_until_t) >= 22.0 and (t - self.last_heal_t) >= 45.0:
             bad_stat = (n_out >= 16 and (waf_r + tmo_r) >= 0.65)
             heal_drop, _, _, _ = self.should_auto_heal(t)
@@ -795,7 +768,7 @@ class SmartController:
                 why = f"WAF/TMO {int((waf_r+tmo_r)*100)}%" if bad_stat else f"{cur_r:.2f}/{peak_r:.2f}/s ({tag})"
                 return 'ROTATE_VPN', {'tag': tag, 'cur_r': cur_r, 'peak_r': peak_r, 'reason': why}
 
-        # 4. Kondisi sehat & masih di bawah max_workers -> coba scale up +1 bertahap
+        # Kondisi sehat & masih di bawah max_workers -> coba scale up +1 bertahap
         if (
             self.auto_scale
             and self.target_workers < self.max_workers
@@ -807,7 +780,7 @@ class SmartController:
             and waf_r < 0.12 and tmo_r < 0.08 and lock_r < 0.12
             and (avail_mb <= 0 or avail_mb >= ram_floor_mb + 290.0)
         ):
-            self.probe_active = (max(cur_r, 0.2), t, self.target_workers)
+            self.last_up_ok_t = t
             return 'SCALE_UP', {'new_w': self.target_workers + 1, 'cur_r': cur_r}
 
         up_mark = '+' if (self.last_up_ok_t > 0 and (t - self.last_up_ok_t) < 15.0) else ''
@@ -5225,7 +5198,7 @@ async def async_main():
             async def new_context(self): return _FakeCtx()
         _bw, _b2t, _bhmax, _bmsg = await _benchmark_vps_capacity(_FakeBrowser(), hw={'cpus': 4.0, 'total_mb': 8192, 'avail_mb': 6000, 'hw_max': 10, 'no_swap': False}, choose_two_tab=True)
         assert 1 <= _bw <= _bhmax <= 10 and 'Auto Worker:' in _bmsg
-        # 6. Unified SmartController brain (AIMD scaling, adaptive timeout, plateau calibration, node reputation)
+        # 6. Unified SmartController brain (no worker scale-down, adaptive timeout, plateau calibration, node reputation)
         sc = SmartController()
         sc.reset(now_t=100.0)
         sc.configure_workers(min_w=2, start_w=6, max_w=10, auto_scale=True, now_t=100.0)
@@ -5233,34 +5206,25 @@ async def async_main():
         for _ in range(10):
             sc.on_outcome('OK', resp_dt=2.0, now_t=105.0)
         assert 4.5 <= sc.adaptive_wait_s(True) <= 5.5
-        act, info = sc.decide_action(avail_mb=300.0, can_rotate_vpn=True, ctx_age=10, is_recycling=False, now_t=125.0)
-        assert act == 'SCALE_DOWN' and info['new_w'] < 6, (act, info)
-        sc.last_action_t = 125.0
-        await sc.set_target_workers(info['new_w'], 'DN', now_t=125.0)
-        # RAM crit must NOT collapse again within 10s
-        act_cool, _ = sc.decide_action(avail_mb=300.0, can_rotate_vpn=True, ctx_age=10, is_recycling=False, now_t=130.0)
-        assert act_cool == 'NONE', act_cool
-        await sc.set_target_workers(6, 'RST', now_t=100.0)
-        sc.last_action_t = 0.0
+        # Low RAM never scales down workers anymore
+        act, _ = sc.decide_action(avail_mb=300.0, can_rotate_vpn=True, ctx_age=10, is_recycling=False, now_t=125.0)
+        assert act == 'NONE' and sc.target_workers == 6, (act, sc.target_workers)
         for i_c in range(30):
             sc.mark_check(now_t=116.0 + i_c * 1.0)
         act_up, info_up = sc.decide_action(avail_mb=2000.0, can_rotate_vpn=True, ctx_age=10, is_recycling=False, now_t=145.0)
-        assert act_up == 'SCALE_UP' and info_up['new_w'] == 7 and sc.probe_active is not None, (act_up, info_up)
+        assert act_up == 'SCALE_UP' and info_up['new_w'] == 7, (act_up, info_up)
         await sc.set_target_workers(7, 'UP', now_t=145.0)
-        # Probe flat -> revert back to 6
-        act_rev, info_rev = sc.decide_action(avail_mb=2000.0, can_rotate_vpn=True, ctx_age=10, is_recycling=False, now_t=158.0)
-        assert act_rev == 'SCALE_DOWN' and info_rev['new_w'] == 6, (act_rev, info_rev)
         sc.mark_worker_dead(1)
         assert sc.live_workers() == 6 and stats['workers'] == 6
         sc.dead_workers.clear()
-        # High WAF at >6 workers on 1-IP VPN scales down workers BEFORE burning VPN nodes
+        # High WAF on 1-IP VPN rotates VPN rather than reducing worker count
         sc_w = SmartController()
         sc_w.reset(now_t=10.0)
         sc_w.configure_workers(min_w=2, start_w=12, max_w=12, auto_scale=True, now_t=10.0)
-        for j in range(12):
-            sc_w.on_outcome('WAF' if j < 6 else 'OK', resp_dt=1.5, now_t=40.0 + j * 0.5)
-        act_w, info_w = sc_w.decide_action(avail_mb=3000.0, can_rotate_vpn=True, ctx_age=50, is_recycling=False, now_t=48.0)
-        assert act_w == 'SCALE_DOWN' and info_w['new_w'] < 12, (act_w, info_w)
+        for j in range(16):
+            sc_w.on_outcome('WAF' if j < 12 else 'OK', resp_dt=1.5, now_t=40.0 + j * 0.5)
+        act_w, _ = sc_w.decide_action(avail_mb=3000.0, can_rotate_vpn=True, ctx_age=50, is_recycling=False, now_t=56.0)
+        assert act_w == 'ROTATE_VPN' and sc_w.target_workers == 12, (act_w, sc_w.target_workers)
         # Gate wait_for_slot wakes when target_workers scales up
         await sc.set_target_workers(4, 'DN')
         async def _wake_up():
@@ -5722,14 +5686,14 @@ async def async_main():
                 if act == 'NONE':
                     continue
                 _PERF.last_action_t = time.monotonic()
-                if act in ('SCALE_DOWN', 'SCALE_UP'):
+                if act == 'SCALE_UP':
                     new_w = int(info.get('new_w', _PERF.target_workers))
                     old_w = _PERF.target_workers
                     why = info.get('reason', f"{info.get('cur_r', 0.0):.1f}/s")
-                    tag_n = f"{new_w}/{_PERF.max_workers}w {'-' if act == 'SCALE_DOWN' else '+'}"
+                    tag_n = f"{new_w}/{_PERF.max_workers}w +"
                     await _PERF.set_target_workers(new_w, tag_n)
                     msg = f"SMART {old_w}->{new_w}w ({why})"
-                    _LIVE_LOGS.append(f" {c(CYAN if act == 'SCALE_UP' else GOLD)}*{W}  {c(CYAN if act == 'SCALE_UP' else GOLD)}{msg[:54]}{W}")
+                    _LIVE_LOGS.append(f" {c(CYAN)}*{W}  {c(CYAN)}{msg[:54]}{W}")
                     if not _TUI_ACTIVE:
                         p_out(f"  {c(CYAN)}[SMART] {msg}{W}")
                 elif act == 'RECYCLE_BROWSER':
