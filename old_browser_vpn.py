@@ -3796,6 +3796,7 @@ def _calc_multi_vpn_slots(workers: int) -> int:
     w = max(1, int(workers))
     return min(45, (w * 3 + 1) // 2)
 _LEASED_PROXIES_MEM: list[str] = []
+_GW_DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 _VPNPOOL_CFG: dict = {
     'sh': '', 'started': False, 'out_file': '', 'lock': None,
     'cooldown': {}, 'rotating': set(), 'tasks': set(),
@@ -3816,7 +3817,7 @@ def _gw_api_call_sync(url: str, token: str, method: str, path: str, payload: dic
         headers['Content-Type'] = 'application/json'
     req = urllib.request.Request(target, data=body, headers=headers, method=method.upper())
     try:
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        with _GW_DIRECT_OPENER.open(req, timeout=timeout_s) as resp:
             raw = resp.read().decode('utf-8', errors='replace')
             code = getattr(resp, 'status', 200)
     except urllib.error.HTTPError as he:
@@ -3846,29 +3847,16 @@ def _vpnpool_slot_from_proxy(proxy: dict | None) -> int:
     m = re.match(r'^socks5://10\.200\.(\d+)\.2:1080$', srv)
     return int(m.group(1)) if m else 0
 
-def _is_managed_proxy(proxy: dict | None) -> bool:
-    if not proxy:
-        return False
-    if _vpnpool_slot_from_proxy(proxy) > 0:
-        return True
-    srv = proxy.get('server', '')
-    usr = proxy.get('username') or ''
-    return bool(
-        _VPNPOOL_CFG.get('api_url')
-        and _VPNPOOL_CFG.get('api_lease_id')
-        and (srv, usr) in _VPNPOOL_CFG.get('proxy_urls', {})
-    )
-
 def _maybe_rotate_vpnpool_slot(proxy: dict | None):
     srv = (proxy or {}).get('server', '')
     usr = (proxy or {}).get('username') or ''
     slot = _vpnpool_slot_from_proxy(proxy)
     sh = _VPNPOOL_CFG.get('sh', '')
-    is_local = bool(sh and _VPNPOOL_CFG.get('started') and slot > 0)
     api_url = _VPNPOOL_CFG.get('api_url', '')
     api_lid = _VPNPOOL_CFG.get('api_lease_id', '')
     pk = (srv, usr)
-    is_api = bool(api_url and api_lid and pk in _VPNPOOL_CFG.get('proxy_urls', {}))
+    is_local = bool(sh and _VPNPOOL_CFG.get('started') and (slot > 0))
+    is_api = bool(api_url and api_lid and (pk in _VPNPOOL_CFG.get('proxy_urls', {})))
     if not (is_local or is_api):
         return
     if srv in _VPNPOOL_CFG['rotating']:
@@ -5347,7 +5335,8 @@ async def _benchmark_vps_capacity(browser, hw: dict | None = None, choose_two_ta
 async def async_main():
     pa = argparse.ArgumentParser(description='MLBB Fast Checker v9.0 VPN — Cross-Platform (Termux/Linux/Windows)')
     pa.add_argument('combo', nargs='?', default='')
-    pa.add_argument('--workers', type=str, default='', help='Jumlah worker (1-30 atau "auto" untuk uji kapasitas VPS)')
+    pa.add_argument('-c', '--combo', dest='combo_flag', type=str, default='', help='Path file combo (alternatif positional combo)')
+    pa.add_argument('-w', '--workers', type=str, default='', help='Jumlah worker (1-30 atau "auto" untuk uji kapasitas VPS)')
     pa.add_argument('--headless', dest='headless', action='store_true', default=None)
     pa.add_argument('--no-headless', dest='headless', action='store_false', default=None)
     pa.add_argument('--debug', action='store_true')
@@ -5373,6 +5362,9 @@ async def async_main():
     pa.add_argument('--ascii', action='store_true', help='Paksa UI pure ASCII (tanpa Unicode box drawing)')
     pa.add_argument('--selftest', action='store_true')
     args = pa.parse_args()
+    args.combo = args.combo or args.combo_flag
+    if args.proxy_file and (args.vpn_api_url or '').strip():
+        pa.error("Pilih salah satu: --proxy-file atau --vpn-api-url")
 
     # Selftest block
     if args.selftest:
@@ -5597,7 +5589,11 @@ async def async_main():
         _gw_thr = threading.Thread(target=_gw_srv.serve_forever, daemon=True)
         _gw_thr.start()
         _saved_vpncfg = {k: (v.copy() if isinstance(v, (dict, set)) else v) for k, v in _VPNPOOL_CFG.items()}
+        _saved_http_proxy = os.environ.get('HTTP_PROXY')
+        _saved_http_proxy_lo = os.environ.get('http_proxy')
         try:
+            os.environ['HTTP_PROXY'] = 'http://127.0.0.1:9'
+            os.environ['http_proxy'] = 'http://127.0.0.1:9'
             _gw_url = f"http://127.0.0.1:{_gw_srv.server_port}"
             st409, d409 = await _gw_api_call(_gw_url, 'tok-abc', 'POST', '/lease', {'count': 99})
             assert st409 == 409 and d409.get('ok') is False
@@ -5612,9 +5608,10 @@ async def async_main():
                 'proxy_urls': {(_parsed_api_p['server'], _parsed_api_p['username']): _raw_api_p},
                 'cooldown': {}, 'rotating': set(), 'tasks': set(), 'lock': None,
             })
-            assert _is_managed_proxy({'server': 'socks5://10.200.4.2:1080'}) is True
-            assert _is_managed_proxy({'server': 'http://1.2.3.4:8080'}) is False
-            assert _is_managed_proxy(_parsed_api_p) is True
+            # Unmanaged proxy must be ignored by _maybe_rotate_vpnpool_slot
+            _maybe_rotate_vpnpool_slot({'server': 'http://1.2.3.4:8080'})
+            assert 'http://1.2.3.4:8080' not in _VPNPOOL_CFG['rotating'] and not _VPNPOOL_CFG['tasks']
+            # API proxy triggers POST /rotate and resets _PROXY_FAILS
             _pk_api = (_parsed_api_p['server'], _parsed_api_p['username'])
             _PROXY_FAILS[_pk_api] = 3
             _maybe_rotate_vpnpool_slot(_parsed_api_p)
@@ -5624,6 +5621,33 @@ async def async_main():
             assert _parsed_api_p['server'] not in _VPNPOOL_CFG['rotating']
             assert any('/rotate' == p and b.get('proxy') == _raw_api_p and b.get('lease_id') == 'lease-test-1' for p, _, b in _gw_calls)
             assert any(f"API slot #{_gw_srv.server_port} rotated" in ln for ln in _LIVE_LOGS)
+            # Local vpn_pool.sh proxy triggers bash rotate <slot> and resets _PROXY_FAILS
+            with tempfile.TemporaryDirectory() as _td_loc:
+                _loc_out = os.path.join(_td_loc, 'vpn_proxies.txt')
+                _loc_srv = 'socks5://10.200.4.2:1080'
+                open(_loc_out, 'w', encoding='utf-8').write(_loc_srv + '\n')
+                _VPNPOOL_CFG.update({'sh': '/tmp/vpn_pool.sh', 'started': True, 'out_file': _loc_out})
+                _PROXY_FAILS[(_loc_srv, '')] = 3
+                _orig_cse = asyncio.create_subprocess_exec
+                _loc_cmds = []
+                class _FakeProc:
+                    pid = 99999
+                    returncode = 0
+                    async def communicate(self): return b'', b''
+                async def _mock_cse(*cmd, **kw):
+                    _loc_cmds.append(cmd)
+                    return _FakeProc()
+                asyncio.create_subprocess_exec = _mock_cse
+                try:
+                    _maybe_rotate_vpnpool_slot({'server': _loc_srv})
+                    if _VPNPOOL_CFG['tasks']:
+                        await asyncio.gather(*list(_VPNPOOL_CFG['tasks']), return_exceptions=True)
+                finally:
+                    asyncio.create_subprocess_exec = _orig_cse
+                    _VPNPOOL_CFG.update({'sh': '', 'started': False, 'out_file': ''})
+                assert _loc_cmds and list(_loc_cmds[0]) == ['bash', '/tmp/vpn_pool.sh', 'rotate', '4']
+                assert _PROXY_FAILS.get((_loc_srv, ''), -1) == 0
+                assert _loc_srv not in _VPNPOOL_CFG['rotating']
             st_hb, d_hb = await _gw_api_call(_gw_url, 'tok-abc', 'POST', '/heartbeat', {'lease_id': 'lease-test-1'})
             assert st_hb == 200 and d_hb.get('ok') is True
             _emergency_cleanup()
@@ -5632,6 +5656,10 @@ async def async_main():
             _rel_calls = [c for c in _gw_calls if c[0] == '/release']
             assert len(_rel_calls) == 1 and _rel_calls[0][2].get('lease_id') == 'lease-test-1'
         finally:
+            if _saved_http_proxy is None: os.environ.pop('HTTP_PROXY', None)
+            else: os.environ['HTTP_PROXY'] = _saved_http_proxy
+            if _saved_http_proxy_lo is None: os.environ.pop('http_proxy', None)
+            else: os.environ['http_proxy'] = _saved_http_proxy_lo
             _VPNPOOL_CFG.clear()
             _VPNPOOL_CFG.update(_saved_vpncfg)
             _PROXY_FAILS.clear()
@@ -6161,7 +6189,12 @@ async def async_main():
                     proxy_assignments[i] = fast_cap[i % len(fast_cap)][1]
             else:
                 p_out(f"\n  {c(RED)}{BD}[!] Semua proxy gagal diuji.{W}")
-                p_out(f"  {c(GOLD)}Penyebab: Kuota DataImpulse habis (407 TRAFFIC_EXHAUSTED) atau proxy offline.{W}")
+                _fail_hint = (
+                    "Gateway ufasproxy tidak terjangkau atau semua proxy gagal probe MT API."
+                    if vpn_api_url else
+                    "Kuota DataImpulse habis (407 TRAFFIC_EXHAUSTED) atau proxy offline."
+                )
+                p_out(f"  {c(GOLD)}Penyebab: {_fail_hint}{W}")
                 p_out(f"  {c(GRAY)}Eksekusi dibatalkan otomatis untuk melindungi IP asli kamu.{W}\n")
                 return
 
@@ -6400,16 +6433,16 @@ async def async_main():
         if _LICENSE_SESSION_ACTIVE:
             withdraw_cloak_license()
             p_out(f"{c(GRAY)}[*] License key CloakBrowser ditarik dari device ✓{W}")
-        _VPNPOOL_CFG['started'] = False
-        _VPNPOOL_CFG['sh'] = ''
-        _lid_rel = _VPNPOOL_CFG.pop('api_lease_id', '')
-        _VPNPOOL_CFG['api_lease_id'] = ''
         _rot_tasks = list(_VPNPOOL_CFG['tasks'])
         for _rt in _rot_tasks:
             if not _rt.done():
                 _rt.cancel()
         if _rot_tasks:
             await asyncio.gather(*_rot_tasks, return_exceptions=True)
+        _VPNPOOL_CFG['started'] = False
+        _VPNPOOL_CFG['sh'] = ''
+        _lid_rel = _VPNPOOL_CFG.pop('api_lease_id', '')
+        _VPNPOOL_CFG['api_lease_id'] = ''
         if _lid_rel:
             _url_rel = _VPNPOOL_CFG.get('api_url', '')
             _tok_rel = _VPNPOOL_CFG.get('api_token', '')
