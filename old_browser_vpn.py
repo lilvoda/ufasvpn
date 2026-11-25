@@ -2112,7 +2112,9 @@ class VpnCoordinator:
 
     async def _preserve_linux_vps_routes(self):
         """Pasang policy routing (table 100) agar SSH/incoming ke IP asli VPS tetap hidup saat OpenVPN mengubah default route."""
-        if os.name == 'nt' or not sys.platform.startswith('linux') or self._linux_ssh_preserved:
+        if os.name == 'nt' or not sys.platform.startswith('linux') or _PLAT['is_android'] or self._linux_ssh_preserved:
+            return
+        if hasattr(os, 'geteuid') and os.geteuid() != 0:
             return
         ip_bin = shutil.which('ip') or ('/sbin/ip' if os.path.isfile('/sbin/ip') else '/usr/sbin/ip')
         if not ip_bin or not os.path.isfile(ip_bin):
@@ -2155,7 +2157,7 @@ class VpnCoordinator:
             else:
                 await _run_ip('route', 'replace', 'default', 'dev', dev, 'table', '100')
             for iface in ('all', dev):
-                rp = f'/proc/sys/net/ipv4/conf/{iface}/rp_filter'
+                rp = f"/proc/sys/net/ipv4/conf/{iface.replace('.', '/')}/rp_filter"
                 if os.path.isfile(rp):
                     try:
                         with open(rp, 'w') as f:
@@ -2278,7 +2280,11 @@ class VpnCoordinator:
         except Exception:
             mgmt_port = 0
         cmd = self._build_ovpn_cmd(cfg, mgmt_port)
-        kw = {'stdout': asyncio.subprocess.PIPE, 'stderr': asyncio.subprocess.STDOUT}
+        kw = {
+            'stdout': asyncio.subprocess.PIPE,
+            'stderr': asyncio.subprocess.STDOUT,
+            'cwd': os.path.dirname(os.path.abspath(cfg)) or None,
+        }
         if os.name != 'nt':
             kw['start_new_session'] = True
         proc = await asyncio.create_subprocess_exec(*cmd, **kw)
@@ -2444,6 +2450,13 @@ class VpnCoordinator:
         await self._cleanup_win_ovpn_state()
         total = len(self.ovpn_files)
         cache = self._load_probe_cache(cache_ttl_s)
+        if use_cache:
+            _meta = cache.get('__meta__')
+            if isinstance(_meta, dict):
+                if _meta.get('dco_off'):
+                    self.ovpn_disable_dco = True
+                if _meta.get('no_dns_blk'):
+                    self.ovpn_ignore_dns_block = True
         live: list[tuple[int, str, str]] = []
         to_probe: list[str] = []
         cached_drops = 0
@@ -2564,6 +2577,16 @@ class VpnCoordinator:
                 p_out(f" {c(RED)}[DROP]{W} [{idx:>2}/{len(to_probe)}] {name} -> {c(GOLD)}{mt_reason}{W}")
 
         await self.stop_ovpn()
+        if os.name == 'nt' and not fatal_perm:
+            try:
+                cache['__meta__'] = {
+                    'ts': time.time(),
+                    'dco_off': bool(self.ovpn_disable_dco),
+                    'no_dns_blk': bool(self.ovpn_ignore_dns_block),
+                }
+                self._save_probe_cache(cache)
+            except Exception:
+                pass
         if fatal_perm or not live:
             self.ovpn_files = []
             return []
@@ -2590,8 +2613,13 @@ class VpnCoordinator:
         if not _TUI_ACTIVE:
             p_out(f"{c(CYAN)}[*] Menghubungkan OpenVPN tercepat ({os.path.basename(self.ovpn_files[0])})...{W}")
         for _ in range(min(10, len(self.ovpn_files))):
-            cur_cfg_name = os.path.basename(self.ovpn_files[self.ovpn_idx % len(self.ovpn_files)])
+            cur_cfg = self.ovpn_files[self.ovpn_idx % len(self.ovpn_files)]
+            cur_cfg_name = os.path.basename(cur_cfg)
             ok, info = await self.start_ovpn(timeout_s=12.0)
+            if (not ok) and os.name == 'nt' and (not self.ovpn_disable_dco) and ('netsh:' in info.lower() or 'command failed' in info.lower()):
+                p_out(f"{c(GOLD)}[*] {cur_cfg_name} netsh/DCO gagal -> coba fallback TAP (--disable-dco)...{W}")
+                self.ovpn_disable_dco = True
+                ok, info = await self.start_ovpn(cfg_override=cur_cfg, timeout_s=12.0)
             if ok:
                 ok_mt, mt_reason, ms = await _probe_direct_moonton_ms(timeout_s=6.0)
                 if ok_mt:
@@ -4272,7 +4300,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                                         finally:
                                             if browser_state is not None:
                                                 browser_state['gate'].set()
-                                        if await open_context_and_page(rotate_ip=True):
+                                        if await _open_ready_ctx(max_tries=3, rotate_ip=True):
                                             continue
                                     finally:
                                         async with ctx_cond:
@@ -4679,9 +4707,13 @@ async def async_main():
                     while True:
                         print(f"  {c(CYAN)}Daftar folder OpenVPN:{W}")
                         for idx_d, (lbl_d, path_d, cnt_d) in enumerate(ovpn_dirs, 1):
-                            auth_tag = f" {c(GREEN)}auth✓{W}" if _has_ovpn_auth(path_d) else ""
+                            auth_tag = f" {c(GREEN)}auth✓{W}" if _has_ovpn_auth(path_d) else f" {c(GOLD)}(no auth.txt){W}"
                             print(f"    {c(WHITE)}[{idx_d}]{W} {lbl_d} {c(GRAY)}({cnt_d} .ovpn){W}{auth_tag}")
-                        sel = ask(f"Pilih folder VPN (1-{len(ovpn_dirs)} / path)", "1")
+                        print(f"    {c(GRAY)}[0] Kembali ke Manual VPN{W}")
+                        sel = ask(f"Pilih folder VPN (0-{len(ovpn_dirs)} / path)", "1")
+                        if sel == "0":
+                            vpn_wait = True
+                            break
                         if sel.isdigit() and 1 <= int(sel) <= len(ovpn_dirs):
                             ovpn_dir = ovpn_dirs[int(sel) - 1][1]
                             break
