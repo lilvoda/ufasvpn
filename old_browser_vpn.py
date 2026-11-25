@@ -2148,6 +2148,14 @@ class VpnCoordinator:
                 await _run_ip('route', 'replace', 'default', 'via', gw, 'dev', dev, 'onlink', 'table', '100')
             else:
                 await _run_ip('route', 'replace', 'default', 'dev', dev, 'table', '100')
+            for iface in ('all', dev):
+                rp = f'/proc/sys/net/ipv4/conf/{iface}/rp_filter'
+                if os.path.isfile(rp):
+                    try:
+                        with open(rp, 'w') as f:
+                            f.write('2\n')
+                    except Exception:
+                        pass
             for ip_addr in ips:
                 await _run_ip('rule', 'del', 'from', f'{ip_addr}/32', 'table', '100')
                 rc_r, _ = await _run_ip('rule', 'add', 'from', f'{ip_addr}/32', 'table', '100', 'priority', '100')
