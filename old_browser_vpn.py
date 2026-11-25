@@ -3766,6 +3766,11 @@ _STATIC_CACHE = {}  # url -> (status, headers, body_bytes)
 _CACHE_LOCKS: dict[str, asyncio.Lock] = {}
 _CACHE_DIRTY = 0
 _PROXY_FAILS: dict[tuple[str, str], int] = {}
+_PROXY_LOAD: dict[str, int] = {}
+
+def _calc_multi_vpn_slots(workers: int) -> int:
+    w = max(1, int(workers))
+    return min(45, (w * 3 + 1) // 2)
 _VPNPOOL_CFG: dict = {
     'sh': '', 'started': False, 'out_file': '', 'lock': None,
     'cooldown': {}, 'rotating': set(), 'tasks': set(),
@@ -4052,6 +4057,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
     pool             = proxy_pool or ([base_proxy_info] if base_proxy_info else [])
     pool_idx         = (wid + wave_idx * 7) % max(len(pool), 1)
     cur_proxy_info   = pool[pool_idx] if pool else None
+    held_proxy_srv   = ''
     rot_user_info    = None
     worker_epoch     = 0
     ctx_vpn_epoch    = 0
@@ -4081,7 +4087,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                 pass
 
     async def _close_ctx():
-        nonlocal ctx, page, page2, slider_cleared, ctx_counted
+        nonlocal ctx, page, page2, slider_cleared, ctx_counted, held_proxy_srv
         try:
             for p in (page2, page):
                 await _cleanup_page(p, close_page=False)
@@ -4093,6 +4099,9 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
         finally:
             ctx = page = page2 = None
             slider_cleared = False
+            if held_proxy_srv:
+                _PROXY_LOAD[held_proxy_srv] = max(0, _PROXY_LOAD.get(held_proxy_srv, 0) - 1)
+                held_proxy_srv = ''
             if ctx_counted and browser_state is not None:
                 ctx_counted = False
                 browser_state['active'] = max(0, browser_state['active'] - 1)
@@ -4131,7 +4140,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
 
     async def open_context_and_page(max_attempts: int = 4, rotate_ip: bool = False) -> bool:
         """Buka context baru pada sticky proxy + navigasi ke login page."""
-        nonlocal worker_epoch, ctx_vpn_epoch, ctx, page, page2, rot_user_info, cur_proxy_info, pool_idx, slider_cleared, ctx_counted, cur_browser
+        nonlocal worker_epoch, ctx_vpn_epoch, ctx, page, page2, rot_user_info, cur_proxy_info, pool_idx, slider_cleared, ctx_counted, cur_browser, held_proxy_srv
         if wave_limit and stats['checked'] >= wave_limit:
             return False
         if rotate_ip:
@@ -4211,46 +4220,47 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
             if pool:
                 picked = None
                 _rot_set = _VPNPOOL_CFG['rotating']
-                for _ in range(len(pool)):
-                    pool_idx = (pool_idx + 1) % len(pool)
-                    cand = pool[pool_idx]
+                _n_pool = len(pool)
+                _cands = []
+                for _off in range(1, _n_pool + 1):
+                    _ci = (pool_idx + _off) % _n_pool
+                    cand = pool[_ci]
                     pk = (cand.get('server', ''), cand.get('username', ''))
                     if cand.get('server', '') not in _rot_set and _PROXY_FAILS.get(pk, 0) < 3:
-                        picked = cand
-                        break
+                        _cands.append((_ci, cand))
+                if _cands:
+                    pool_idx, picked = min(_cands, key=lambda x: _PROXY_LOAD.get(x[1].get('server', ''), 0))
                 if picked is None:
                     for _pk_clr in [k for k in list(_PROXY_FAILS) if k[0] not in _rot_set]:
                         _PROXY_FAILS.pop(_pk_clr, None)
-                    for _ in range(len(pool)):
-                        pool_idx = (pool_idx + 1) % len(pool)
-                        cand = pool[pool_idx]
-                        if cand.get('server', '') not in _rot_set:
-                            picked = cand
-                            break
-                if picked is None:
-                    # Wait cleanly when all pool slots are mid-rotation (e.g. 1-slot Multi-VPN)
                     _wait_end = time.monotonic() + 18.0
                     while time.monotonic() < _wait_end and all(c.get('server', '') in _rot_set for c in pool):
                         await asyncio.sleep(0.5)
-                    for _ in range(len(pool)):
-                        pool_idx = (pool_idx + 1) % len(pool)
-                        cand = pool[pool_idx]
+                    _cands2 = []
+                    for _off in range(1, _n_pool + 1):
+                        _ci = (pool_idx + _off) % _n_pool
+                        cand = pool[_ci]
                         if cand.get('server', '') not in _rot_set:
-                            picked = cand
-                            break
+                            _cands2.append((_ci, cand))
+                    if _cands2:
+                        pool_idx, picked = min(_cands2, key=lambda x: _PROXY_LOAD.get(x[1].get('server', ''), 0))
                 if picked is None:
                     if attempt < max_attempts:
                         await asyncio.sleep(1.5)
                         continue
-                    pool_idx = (pool_idx + 1) % len(pool)
+                    pool_idx = (pool_idx + 1) % _n_pool
                     picked = pool[pool_idx]
                 cur_proxy_info = picked
+                held_proxy_srv = cur_proxy_info.get('server', '') if cur_proxy_info else ''
+                if held_proxy_srv:
+                    _PROXY_LOAD[held_proxy_srv] = _PROXY_LOAD.get(held_proxy_srv, 0) + 1
             b = None
             try:
                 if browser_state is not None and not browser_state['gate'].is_set():
                     try:
                         await asyncio.wait_for(browser_state['gate'].wait(), timeout=45.0)
                     except asyncio.TimeoutError:
+                        await _close_ctx()
                         continue
                 if browser_state is not None and not ctx_counted:
                     ctx_counted = True
@@ -5388,6 +5398,7 @@ async def async_main():
         assert act_ram == 'RECYCLE_BROWSER' and sc_w.target_workers == 12, (act_ram, sc_w.target_workers)
         assert _vpnpool_slot_from_proxy({'server': 'socks5://10.200.4.2:1080'}) == 4
         assert _vpnpool_slot_from_proxy({'server': 'http://1.2.3.4:8080'}) == 0
+        assert _calc_multi_vpn_slots(10) == 15 and _calc_multi_vpn_slots(4) == 6 and _calc_multi_vpn_slots(1) == 2
         # Gate wait_for_slot wakes when target_workers scales up
         await sc.set_target_workers(4, 'DN')
         async def _wake_up():
@@ -5489,10 +5500,10 @@ async def async_main():
     ovpn_dir = (args.vpn_ovpn_dir or '').strip()
     skip_ovpn_test = bool(args.skip_ovpn_test)
     multi_vpn_slots = 0
-    multi_vpn_auto = False
     multi_vpn_dir = ''
     multi_vpn_sh = ''
     multi_vpn_started = False
+    _PROXY_LOAD.clear()
     _VPNPOOL_CFG.update({
         'sh': '', 'started': False, 'out_file': '', 'lock': None,
         'cooldown': {}, 'rotating': set(), 'tasks': set(),
@@ -5639,7 +5650,7 @@ async def async_main():
                 skip_ovpn_test = False
                 _pool_sh = os.path.join(BASE, 'vpn_pool.sh')
                 if os.name != 'nt' and os.path.isfile(_pool_sh) and not args.no_prompt:
-                    if ask_yn("Multi-VPN proxy pool? (anti-pause, tiap worker beda IP)", default='y'):
+                    if ask_yn("Multi-VPN proxy pool? (anti-pause, worker + 50% backup)", default='y'):
                         _sys_path = os.environ.get('PATH', '') + ':/usr/sbin:/sbin'
                         _miss = [b for b in ('openvpn', 'microsocks', 'iptables', 'ip', 'sysctl', 'flock') if not shutil.which(b, path=_sys_path)]
                         if hasattr(os, 'geteuid') and os.geteuid() != 0:
@@ -5647,12 +5658,7 @@ async def async_main():
                         elif _miss:
                             p_out(f"  {c(GOLD)}[!] Multi-VPN butuh {', '.join(_miss)} (apt-get install -y openvpn microsocks iptables procps util-linux) -> lanjut OpenVPN tunggal.{W}")
                         else:
-                            _sl_in = ask("Jumlah tunnel Multi-VPN (1-20 / auto)", "auto").strip().lower()
-                            if _sl_in in ('', 'auto', 'a'):
-                                multi_vpn_auto = True
-                                multi_vpn_slots = max(1, min(20, workers))
-                            else:
-                                multi_vpn_slots = max(1, min(20, int(_sl_in) if _sl_in.isdigit() else min(8, max(2, workers))))
+                            multi_vpn_slots = _calc_multi_vpn_slots(workers)
                             multi_vpn_dir = _resolve_ovpn_dir_input(ovpn_dir)
                             _avail_cfg = _count_ovpn_files(multi_vpn_dir)
                             if _avail_cfg > 0:
@@ -5694,7 +5700,7 @@ async def async_main():
         vpn_ip_init = await fetch_public_ip(timeout_s=4.5)
         vpn_coord.current_ip = vpn_ip_init
 
-    _mode_str = (f"Multi-VPN ({'auto=sesuai worker' if multi_vpn_auto and auto_workers else f'{multi_vpn_slots} tunnel'} -> {shortpath(PROXY_FILE)})" if multi_vpn_slots > 0 else shortpath(PROXY_FILE)) if PROXY_ENABLED else (
+    _mode_str = (f"Multi-VPN ({'worker+50% backup' if auto_workers else f'{multi_vpn_slots} tunnel'} -> {shortpath(PROXY_FILE)})" if multi_vpn_slots > 0 else shortpath(PROXY_FILE)) if PROXY_ENABLED else (
         f"OpenVPN auto ({shortpath(vpn_coord.ovpn_dir)}: {len(vpn_coord.ovpn_files)} .ovpn)" if (vpn_coord and vpn_coord.ovpn_files) else (
             f"{vpn_coord.label()} (cmd)" if vpn_cmd else (f"{vpn_coord.label()} (manual-wait)" if vpn_wait else f"{vpn_coord.label()} (cooldown {int(waf_cooldown)}s)")
         )
@@ -5825,8 +5831,7 @@ async def async_main():
         else:
             NUM_CONTEXTS = workers = spawn_w
         if multi_vpn_slots > 0 and multi_vpn_sh:
-            if multi_vpn_auto:
-                multi_vpn_slots = max(1, min(20, spawn_w))
+            multi_vpn_slots = _calc_multi_vpn_slots(spawn_w)
             _avail_cfg = _count_ovpn_files(multi_vpn_dir)
             if _avail_cfg > 0:
                 multi_vpn_slots = min(multi_vpn_slots, _avail_cfg)
@@ -5839,7 +5844,7 @@ async def async_main():
                 start_new_session=(os.name != 'nt'),
             )
             try:
-                _vp_out, _ = await asyncio.wait_for(_vp_proc.communicate(), timeout=45.0)
+                _vp_out, _ = await asyncio.wait_for(_vp_proc.communicate(), timeout=55.0)
             except asyncio.TimeoutError:
                 _kill_pid_tree(_vp_proc.pid)
                 p_out(f"{c(RED)}[!] Timeout menyalakan Multi-VPN pool.{W}")
@@ -5869,7 +5874,7 @@ async def async_main():
             p_out(f"{c(CYAN)}[*] Menguji ping proxy ke API Moonton ({len(raw_p)} proxy)...{W}")
             good_proxies = await test_proxies(raw_p, concurrency=16)
             if good_proxies:
-                fast_cap = good_proxies[:max(24, NUM_CONTEXTS * 3)]
+                fast_cap = good_proxies[:max(45, NUM_CONTEXTS * 3)]
                 p_out(f"{c(GREEN)}[*] {len(good_proxies)} proxy berfungsi, pakai {len(fast_cap)} tercepat ✓{W}")
                 live_pool = [p[1] for p in fast_cap]
                 for i in range(NUM_CONTEXTS):
@@ -5998,6 +6003,7 @@ async def async_main():
             wave_idx = 0
             while combo_q.pending > 0 and not (vpn_coord and vpn_coord.ovpn_failed):
                 _PROXY_FAILS.clear()
+                _PROXY_LOAD.clear()
                 checked_before = stats['checked']
                 wave_limit = checked_before + WAVE_REFRESH_EVERY
                 num_workers = min(NUM_CONTEXTS, max(1, combo_q.pending))
