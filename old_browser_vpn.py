@@ -268,6 +268,13 @@ def _kill_ovpn_tree():
 def _emergency_cleanup():
     _kill_driver_tree()
     _kill_ovpn_tree()
+    sh = _VPNPOOL_CFG.get('sh', '') if '_VPNPOOL_CFG' in globals() else ''
+    if sh and _VPNPOOL_CFG.get('started'):
+        _VPNPOOL_CFG['started'] = False
+        try:
+            subprocess.run(['bash', sh, 'stop'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
+        except Exception:
+            pass
     if _LICENSE_SESSION_ACTIVE:
         withdraw_cloak_license()
 
@@ -557,6 +564,9 @@ class SmartController:
 
     def mark_worker_dead(self, wid: int):
         self.dead_workers.add(int(wid))
+        # ponytail: if all active workers died while headroom slots wait, promote max_workers so pool never deadlocks
+        if self.live_workers() == 0 and self.target_workers < self.max_workers:
+            self.target_workers = self.max_workers
         stats['workers'] = self.live_workers()
 
     async def set_target_workers(self, new_w: int, note: str = '', now_t: float | None = None):
@@ -583,7 +593,7 @@ class SmartController:
 
     async def wait_for_slot(self, wid: int, stop_fn) -> bool:
         while self.target_workers > 0 and wid >= self.target_workers:
-            if stop_fn():
+            if stop_fn() or len(self.dead_workers) >= self.max_workers:
                 return False
             cond = self._get_slot_cond()
             async with cond:
@@ -593,7 +603,7 @@ class SmartController:
                     await asyncio.wait_for(cond.wait(), timeout=1.5)
                 except asyncio.TimeoutError:
                     pass
-        return not stop_fn()
+        return (not stop_fn()) and len(self.dead_workers) < self.max_workers
 
     def current_node_summary(self, now_t: float | None = None) -> tuple[float, float, float]:
         t = time.monotonic() if now_t is None else now_t
@@ -605,6 +615,7 @@ class SmartController:
 
     def resume(self, now_t: float | None = None):
         t = time.monotonic() if now_t is None else now_t
+        self._prune(t)
         # Kalibrasi plateau bila beberapa node berturut-turut sehat di rate konsisten
         n_el = t - self.node_start_t
         if n_el >= 18.0 and self.node_checks >= 12 and self.session_peak > 0:
@@ -754,11 +765,13 @@ class SmartController:
 
         if not is_recycling and (
             (tag == 'LOCK' and is_drop and (t - self.last_heal_t) >= 25.0)
+            or (avail_mb > 0 and avail_mb < ram_floor_mb and (t - self.last_heal_t) >= 45.0)
             or (ctx_age >= max(400, self.target_workers * 35) and (t - self.last_heal_t) >= 45.0)
         ):
             if (t - self.pause_until_t) >= 8.0:
                 self.scale_up_cooldown_t = max(self.scale_up_cooldown_t, t + 25.0)
-                return 'RECYCLE_BROWSER', {'cur_r': cur_r, 'peak_r': peak_r, 'reason': tag if is_drop else 'ctx_age'}
+                why_rec = f"RAM {int(avail_mb)}MB" if (avail_mb > 0 and avail_mb < ram_floor_mb) else (tag if is_drop else 'ctx_age')
+                return 'RECYCLE_BROWSER', {'cur_r': cur_r, 'peak_r': peak_r, 'reason': why_rec}
 
         # Degradasi VPN / WAF berat setelah cukup sampel -> rotasi VPN (hindari rotasi tiap 40s)
         if can_rotate_vpn and (t - self.pause_until_t) >= 22.0 and (t - self.last_heal_t) >= 45.0:
@@ -3753,7 +3766,10 @@ _STATIC_CACHE = {}  # url -> (status, headers, body_bytes)
 _CACHE_LOCKS: dict[str, asyncio.Lock] = {}
 _CACHE_DIRTY = 0
 _PROXY_FAILS: dict[tuple[str, str], int] = {}
-_VPNPOOL_CFG: dict = {'sh': '', 'lock': None, 'cooldown': {}}
+_VPNPOOL_CFG: dict = {
+    'sh': '', 'started': False, 'out_file': '', 'lock': None,
+    'cooldown': {}, 'rotating': set(), 'tasks': set(),
+}
 
 def _vpnpool_slot_from_proxy(proxy: dict | None) -> int:
     srv = (proxy or {}).get('server', '')
@@ -3762,36 +3778,70 @@ def _vpnpool_slot_from_proxy(proxy: dict | None) -> int:
 
 def _maybe_rotate_vpnpool_slot(proxy: dict | None):
     sh = _VPNPOOL_CFG.get('sh', '')
+    srv = (proxy or {}).get('server', '')
     slot = _vpnpool_slot_from_proxy(proxy)
-    if not sh or slot <= 0:
+    if not sh or not _VPNPOOL_CFG.get('started') or slot <= 0:
+        return
+    if srv in _VPNPOOL_CFG['rotating']:
         return
     now_t = time.monotonic()
     cd = _VPNPOOL_CFG['cooldown']
     if now_t < cd.get(slot, 0.0):
         return
-    cd[slot] = now_t + 60.0
+    _VPNPOOL_CFG['rotating'].add(srv)
+
     async def _rot_bg():
+        ok_rot = False
         lk = _VPNPOOL_CFG['lock']
         if lk is None:
             lk = asyncio.Lock()
             _VPNPOOL_CFG['lock'] = lk
-        async with lk:
-            try:
+        p = None
+        try:
+            async with lk:
+                if not _VPNPOOL_CFG.get('started'):
+                    return
                 p = await asyncio.create_subprocess_exec(
                     'bash', sh, 'rotate', str(slot),
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
                 )
-                await asyncio.wait_for(p.communicate(), timeout=35.0)
-                if p.returncode == 0:
-                    pk = ((proxy or {}).get('server', ''), (proxy or {}).get('username', ''))
+                try:
+                    await asyncio.wait_for(p.communicate(), timeout=35.0)
+                except asyncio.TimeoutError:
+                    _kill_pid_tree(p.pid)
+                    dbg(f"vpnpool rotate slot {slot} timeout 35s")
+                    return
+                out_f = _VPNPOOL_CFG.get('out_file', '')
+                in_file = True
+                if out_f and os.path.isfile(out_f):
+                    try:
+                        with open(out_f, encoding='utf-8', errors='ignore') as f_p:
+                            in_file = any(ln.strip() == srv for ln in f_p)
+                    except Exception:
+                        in_file = False
+                if p.returncode == 0 and in_file:
+                    ok_rot = True
+                    pk = (srv, (proxy or {}).get('username', ''))
                     _PROXY_FAILS[pk] = 0
                     _LIVE_LOGS.append(f" {c(CYAN)}*{W}  {c(CYAN)}VPN Pool slot #{slot} rotated ✓{W}")
-            except Exception as e:
-                dbg(f"vpnpool rotate slot {slot} err: {e}")
+                else:
+                    _LIVE_LOGS.append(f" {c(GOLD)}!{W}  {c(GOLD)}VPN Pool slot #{slot} gagal rotasi{W}")
+        except asyncio.CancelledError:
+            if p is not None and p.returncode is None:
+                _kill_pid_tree(p.pid)
+            raise
+        except Exception as e:
+            dbg(f"vpnpool rotate slot {slot} err: {e}")
+        finally:
+            cd[slot] = time.monotonic() + (60.0 if ok_rot else 25.0)
+            _VPNPOOL_CFG['rotating'].discard(srv)
+
     try:
-        asyncio.create_task(_rot_bg())
+        t_bg = asyncio.create_task(_rot_bg())
+        _VPNPOOL_CFG['tasks'].add(t_bg)
+        t_bg.add_done_callback(lambda _t: _VPNPOOL_CFG['tasks'].discard(_t))
     except RuntimeError:
-        pass
+        _VPNPOOL_CFG['rotating'].discard(srv)
 _RUN_SALT = f"{os.getpid() % 0xfff:x}{int(time.time()) % 0xffff:x}"
 
 def _load_static_cache(path: str = '') -> int:
@@ -4114,6 +4164,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
             elif (
                 ensure_browser
                 and not browser_state['recycling']
+                and time.monotonic() >= browser_state.get('recycle_fail_until', 0.0)
                 and (browser_state.get('force_recycle') or (stats['checked'] - browser_state.get('born_chk', 0)) >= _recycle_chk)
                 and (not wave_limit or stats['checked'] < wave_limit - 15)
             ):
@@ -4135,13 +4186,16 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                 except Exception:
                     pass
                 finally:
+                    browser_state['force_recycle'] = False
                     if did_recycle:
                         browser_state['born_ctx'] = stats['proxy_ctx']
                         browser_state['born_chk'] = stats['checked']
-                        browser_state['force_recycle'] = False
+                        browser_state['recycle_fail_until'] = 0.0
+                        _PERF.resume()
+                    else:
+                        browser_state['recycle_fail_until'] = time.monotonic() + 30.0
                     browser_state['recycling'] = False
                     browser_state['gate'].set()
-                    _PERF.resume()
 
         for attempt in range(1, max_attempts + 1):
             if wave_limit and stats['checked'] >= wave_limit:
@@ -4155,15 +4209,27 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
             rot_user_info = None
             if pool:
                 picked = None
+                _rot_set = _VPNPOOL_CFG['rotating']
                 for _ in range(len(pool)):
                     pool_idx = (pool_idx + 1) % len(pool)
                     cand = pool[pool_idx]
                     pk = (cand.get('server', ''), cand.get('username', ''))
-                    if _PROXY_FAILS.get(pk, 0) < 3:
+                    if cand.get('server', '') not in _rot_set and _PROXY_FAILS.get(pk, 0) < 3:
                         picked = cand
                         break
                 if picked is None:
-                    _PROXY_FAILS.clear()
+                    for _pk_clr in [k for k in list(_PROXY_FAILS) if k[0] not in _rot_set]:
+                        _PROXY_FAILS.pop(_pk_clr, None)
+                    for _ in range(len(pool)):
+                        pool_idx = (pool_idx + 1) % len(pool)
+                        cand = pool[pool_idx]
+                        if cand.get('server', '') not in _rot_set:
+                            picked = cand
+                            break
+                if picked is None:
+                    if attempt < max_attempts:
+                        await asyncio.sleep(1.5)
+                        continue
                     pool_idx = (pool_idx + 1) % len(pool)
                     picked = pool[pool_idx]
                 cur_proxy_info = picked
@@ -4242,6 +4308,8 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                     if cur_proxy_info and _ctx_dt >= 8.0:
                         pk = (cur_proxy_info.get('server', ''), cur_proxy_info.get('username', ''))
                         _PROXY_FAILS[pk] = _PROXY_FAILS.get(pk, 0) + 1
+                        if _PROXY_FAILS[pk] >= 3:
+                            _maybe_rotate_vpnpool_slot(cur_proxy_info)
                 return True
             except Exception as e:
                 err_s = str(e)
@@ -4273,6 +4341,8 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                 elif cur_proxy_info:
                     pk = (cur_proxy_info.get('server', ''), cur_proxy_info.get('username', ''))
                     _PROXY_FAILS[pk] = _PROXY_FAILS.get(pk, 0) + 1
+                    if _PROXY_FAILS[pk] >= 3:
+                        _maybe_rotate_vpnpool_slot(cur_proxy_info)
                 if ('ERR_TUNNEL_CONNECTION_FAILED' in err_s or 'ERR_PROXY_CONNECTION_FAILED' in err_s) and rot_user_info:
                     bad_reg = rot_user_info.get('region', '').lower()
                     if bad_reg and bad_reg not in ('proxy', 'direct'):
@@ -4763,6 +4833,11 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                         print_progress()
                         if vpn_coord and (kind in ('WAF', 'RATE') or err_msg == 'timeout_waiting_response'):
                             await vpn_coord.on_waf_or_rate(seen_vpn_ep, kind or err_msg, browser_state, stats)
+                        if cur_proxy_info and (kind in ('WAF', 'RATE') or res_data.get('proxy_407') or any(k in err_low for k in ('socks', 'proxy', 'tunnel', 'timeout', 'timed_out', 'reset', 'refused', 'aborted', 'connection', 'err_'))):
+                            pk = (cur_proxy_info.get('server', ''), cur_proxy_info.get('username', ''))
+                            _PROXY_FAILS[pk] = _PROXY_FAILS.get(pk, 0) + 1
+                            if _PROXY_FAILS[pk] >= 3:
+                                _maybe_rotate_vpnpool_slot(cur_proxy_info)
                         if kind in ('WAF', 'RATE') or res_data.get('proxy_407') or err_msg in ('PROXY_HTTP_ERR', 'timeout_waiting_response') or any(k in err_msg for k in ('TUNNEL', 'PROXY', 'CONNECTION_FAILED')):
                             try:
                                 await _recover_ctx(my_gen, 'rotate')
@@ -4781,7 +4856,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                         waf_mode = 'rotate' if (did_vpn or ctx_accts >= 4 or _acct_retries[k_id] >= 2) else 'waf_refresh'
                         if not await _recover_ctx(my_gen, waf_mode):
                             raise RuntimeError(f"w{wid}_waf_recovery_failed")
-                    elif kind == 'RATE' or res_data.get('proxy_407') or any(k in err_msg for k in ('TUNNEL', 'PROXY', 'CONNECTION_FAILED', 'Connection closed', 'Target closed')) or err_msg == 'timeout_waiting_response':
+                    elif kind == 'RATE' or res_data.get('proxy_407') or any(k in err_msg for k in ('TUNNEL', 'PROXY', 'SOCKS', 'CONNECTION_FAILED', 'TIMED_OUT', 'Connection closed', 'Target closed')) or err_msg == 'timeout_waiting_response':
                         if vpn_coord and (kind == 'RATE' or err_msg == 'timeout_waiting_response'):
                             await vpn_coord.on_waf_or_rate(seen_vpn_ep, kind or err_msg, browser_state, stats)
                         if cur_proxy_info and not res_data.get('proxy_407'):
@@ -4792,7 +4867,13 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                         if not await _recover_ctx(my_gen, 'rotate'):
                             raise RuntimeError(f"w{wid}_rate_recovery_failed")
                     else:
-                        if vpn_coord and any(k in err_low for k in ('timeout', 'timed_out', 'not_loaded', 'err_', 'reset', 'refused', 'aborted')):
+                        _is_net_err = any(k in err_low for k in ('timeout', 'timed_out', 'not_loaded', 'err_', 'reset', 'refused', 'aborted', 'socks', 'connection'))
+                        if cur_proxy_info and _is_net_err:
+                            pk = (cur_proxy_info.get('server', ''), cur_proxy_info.get('username', ''))
+                            _PROXY_FAILS[pk] = _PROXY_FAILS.get(pk, 0) + 1
+                            if _PROXY_FAILS[pk] >= 3:
+                                _maybe_rotate_vpnpool_slot(cur_proxy_info)
+                        if vpn_coord and _is_net_err:
                             await vpn_coord.on_waf_or_rate(seen_vpn_ep, err_msg[:20] or 'net_err', browser_state, stats)
                         err_mode = 'rotate' if _acct_retries[k_id] >= 2 else 'waf_refresh'
                         if not await _recover_ctx(my_gen, err_mode):
@@ -4816,6 +4897,12 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
 
     tab_tasks = []
     try:
+        if wid >= _PERF.target_workers:
+            if not await _PERF.wait_for_slot(
+                wid,
+                lambda: (combo_q.pending <= 0) or bool(wave_limit and stats['checked'] >= wave_limit) or bool(vpn_coord and vpn_coord.ovpn_failed),
+            ):
+                return
         if not await _open_ready_ctx(max_tries=3):
             if not _TUI_ACTIVE: p_out(f"{c(RED)}[!] Worker {wid} gagal startup, mencoba restart...{W}")
             if combo_q.pending > 0:
@@ -5253,17 +5340,30 @@ async def async_main():
         for _ in range(10):
             sc.on_outcome('OK', resp_dt=2.0, now_t=105.0)
         assert 4.5 <= sc.adaptive_wait_s(True) <= 5.5
-        # Low RAM never scales down workers anymore
+        # Low RAM recycles Chromium instead of scaling down workers
         act, _ = sc.decide_action(avail_mb=300.0, can_rotate_vpn=True, ctx_age=10, is_recycling=False, now_t=125.0)
-        assert act == 'NONE' and sc.target_workers == 6, (act, sc.target_workers)
+        assert act == 'RECYCLE_BROWSER' and sc.target_workers == 6, (act, sc.target_workers)
+        sc.last_heal_t = 125.0
         for i_c in range(30):
-            sc.mark_check(now_t=116.0 + i_c * 1.0)
-        act_up, info_up = sc.decide_action(avail_mb=2000.0, can_rotate_vpn=True, ctx_age=10, is_recycling=False, now_t=145.0)
+            sc.mark_check(now_t=126.0 + i_c * 1.0)
+        act_up, info_up = sc.decide_action(avail_mb=2000.0, can_rotate_vpn=True, ctx_age=10, is_recycling=False, now_t=155.0)
         assert act_up == 'SCALE_UP' and info_up['new_w'] == 7, (act_up, info_up)
         await sc.set_target_workers(7, 'UP', now_t=145.0)
-        sc.mark_worker_dead(1)
-        assert sc.live_workers() == 6 and stats['workers'] == 6
-        sc.dead_workers.clear()
+        _saved_w = stats.get('workers', 0)
+        try:
+            sc.mark_worker_dead(1)
+            assert sc.live_workers() == 6 and stats['workers'] == 6
+            sc.dead_workers.clear()
+            # Dead active pool promotes headroom workers instead of deadlocking wait_for_slot
+            sc_dl = SmartController()
+            sc_dl.reset(now_t=10.0)
+            sc_dl.configure_workers(min_w=1, start_w=1, max_w=2, auto_scale=True, now_t=10.0)
+            sc_dl.mark_worker_dead(0)
+            assert sc_dl.target_workers == 2 and await sc_dl.wait_for_slot(1, lambda: False)
+            sc_dl.mark_worker_dead(1)
+            assert not await sc_dl.wait_for_slot(1, lambda: False)
+        finally:
+            stats['workers'] = _saved_w
         # High WAF on 1-IP VPN rotates VPN rather than reducing worker count
         sc_w = SmartController()
         sc_w.reset(now_t=10.0)
@@ -5272,6 +5372,8 @@ async def async_main():
             sc_w.on_outcome('WAF' if j < 12 else 'OK', resp_dt=1.5, now_t=40.0 + j * 0.5)
         act_w, _ = sc_w.decide_action(avail_mb=3000.0, can_rotate_vpn=True, ctx_age=50, is_recycling=False, now_t=56.0)
         assert act_w == 'ROTATE_VPN' and sc_w.target_workers == 12, (act_w, sc_w.target_workers)
+        act_ram, _ = sc_w.decide_action(avail_mb=200.0, can_rotate_vpn=False, ctx_age=10, is_recycling=False, now_t=70.0)
+        assert act_ram == 'RECYCLE_BROWSER' and sc_w.target_workers == 12, (act_ram, sc_w.target_workers)
         assert _vpnpool_slot_from_proxy({'server': 'socks5://10.200.4.2:1080'}) == 4
         assert _vpnpool_slot_from_proxy({'server': 'http://1.2.3.4:8080'}) == 0
         # Gate wait_for_slot wakes when target_workers scales up
@@ -5378,7 +5480,10 @@ async def async_main():
     multi_vpn_dir = ''
     multi_vpn_sh = ''
     multi_vpn_started = False
-    _VPNPOOL_CFG.update({'sh': '', 'lock': None, 'cooldown': {}})
+    _VPNPOOL_CFG.update({
+        'sh': '', 'started': False, 'out_file': '', 'lock': None,
+        'cooldown': {}, 'rotating': set(), 'tasks': set(),
+    })
 
     if args.out:
         OUTPUT_DIR = os.path.abspath(args.out) if os.path.isabs(args.out) else os.path.join(BASE, args.out)
@@ -5439,7 +5544,7 @@ async def async_main():
             default_combo = os.path.join(PROJECT_ROOT, 'Base', 'combo.txt')
         if not os.path.exists(default_combo):
             default_combo = os.path.join(BASE, 'combo.txt')
-        combo_path = ask("Combo file ", default_combo)
+        combo_path = ask("Combo file ", args.combo or default_combo)
         if not os.path.isabs(combo_path):
             for cand in (os.path.join(BASE, 'input', combo_path), os.path.join(BASE, combo_path)):
                 if os.path.exists(cand):
@@ -5676,7 +5781,7 @@ async def async_main():
         if multi_vpn_slots > 0 and multi_vpn_sh:
             p_out(f"{c(CYAN)}[*] Menyalakan {multi_vpn_slots} tunnel Multi-VPN ({shortpath(multi_vpn_dir)})...{W}")
             multi_vpn_started = True
-            _VPNPOOL_CFG['sh'] = multi_vpn_sh
+            _VPNPOOL_CFG.update({'sh': multi_vpn_sh, 'started': True, 'out_file': PROXY_FILE})
             _vp_proc = await asyncio.create_subprocess_exec(
                 'bash', multi_vpn_sh, 'start', multi_vpn_dir, str(multi_vpn_slots), PROXY_FILE,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
@@ -5971,7 +6076,15 @@ async def async_main():
             withdraw_cloak_license()
             p_out(f"{c(GRAY)}[*] License key CloakBrowser ditarik dari device ✓{W}")
         if multi_vpn_started and multi_vpn_sh:
+            _VPNPOOL_CFG['started'] = False
             _VPNPOOL_CFG['sh'] = ''
+            _rot_tasks = list(_VPNPOOL_CFG['tasks'])
+            for _rt in _rot_tasks:
+                if not _rt.done():
+                    _rt.cancel()
+            if _rot_tasks:
+                await asyncio.gather(*_rot_tasks, return_exceptions=True)
+            _sp = None
             try:
                 _sp = await asyncio.create_subprocess_exec(
                     'bash', multi_vpn_sh, 'stop',
@@ -5979,7 +6092,8 @@ async def async_main():
                 )
                 await asyncio.wait_for(_sp.wait(), timeout=12.0)
             except BaseException:
-                pass
+                if _sp is not None and _sp.returncode is None:
+                    _kill_pid_tree(_sp.pid)
         if vpn_coord is not None:
             vpn_coord.ovpn_started = False
             if vpn_coord._ovpn_proc is not None or vpn_coord.ovpn_files:
