@@ -2437,7 +2437,7 @@ class VpnCoordinator:
         await self._preserve_linux_vps_routes()
         await self._cleanup_win_ovpn_state()
         total = len(self.ovpn_files)
-        cache = self._load_probe_cache(cache_ttl_s) if use_cache else {}
+        cache = self._load_probe_cache(cache_ttl_s)
         live: list[tuple[int, str, str]] = []
         to_probe: list[str] = []
         cached_drops = 0
@@ -2567,6 +2567,14 @@ class VpnCoordinator:
         p_out(f" {c(GREEN)}[ OK ]{W} {len(live)}/{total} OpenVPN lolos uji API Moonton (tercepat: {os.path.basename(live[0][1])} {live[0][0]}ms)")
         return self.ovpn_files
 
+    def _drop_probe_cache_entry(self, cfg_name: str):
+        if not cfg_name:
+            return
+        cache = self._load_probe_cache()
+        if cfg_name in cache:
+            cache.pop(cfg_name, None)
+            self._save_probe_cache(cache)
+
     async def start_initial_ovpn(self, stats_dict: dict) -> bool:
         if not self.ovpn_files:
             return True
@@ -2575,8 +2583,9 @@ class VpnCoordinator:
         await self._cleanup_win_ovpn_state()
         if not _TUI_ACTIVE:
             p_out(f"{c(CYAN)}[*] Menghubungkan OpenVPN tercepat ({os.path.basename(self.ovpn_files[0])})...{W}")
-        for _ in range(min(3, len(self.ovpn_files))):
-            ok, info = await self.start_ovpn()
+        for _ in range(min(10, len(self.ovpn_files))):
+            cur_cfg_name = os.path.basename(self.ovpn_files[self.ovpn_idx % len(self.ovpn_files)])
+            ok, info = await self.start_ovpn(timeout_s=12.0)
             if ok:
                 ok_mt, mt_reason, ms = await _probe_direct_moonton_ms(timeout_s=6.0)
                 if ok_mt:
@@ -2590,15 +2599,22 @@ class VpnCoordinator:
                         p_out(f"{c(GREEN)}[*] OpenVPN terhubung [{info}] {ms}ms (IP: {self.current_ip}) ✓{W}")
                     return True
                 p_out(f"{c(GOLD)}[!] OpenVPN {info} tidak tembus API Moonton ({mt_reason}), coba berikutnya...{W}")
+                self._drop_probe_cache_entry(cur_cfg_name)
                 await self.stop_ovpn()
             else:
                 p_out(f"{c(RED)}[!] OpenVPN gagal start: {info}{W}")
-                if os.name == 'nt' and any(k in info.lower() for k in ('denied', 'tun', 'tap', 'route', 'privileg')):
+                low_i = info.lower()
+                if os.name == 'nt' and any(k in low_i for k in ('denied', 'tun', 'tap', 'route', 'privileg')):
                     p_out(f"{c(GOLD)}[!] Tip Windows: jalankan terminal sebagai Administrator agar OpenVPN bisa buat interface TUN.{W}")
                     return False
-                elif os.name != 'nt' and any(k in info.lower() for k in ('permitted', 'tun', 'permission')):
-                    p_out(f"{c(GOLD)}[!] Tip Linux: jalankan dengan sudo untuk interface TUN.{W}")
+                elif os.name != 'nt' and any(k in low_i for k in ('permitted', 'tun', 'permission', 'no such file')):
+                    is_root = hasattr(os, 'geteuid') and os.geteuid() == 0
+                    if is_root:
+                        p_out(f"{c(GOLD)}[!] Tip Proxmox/LXC: /dev/net/tun belum aktif di host; tambahkan device passthrough di host node.{W}")
+                    else:
+                        p_out(f"{c(GOLD)}[!] Tip Linux: jalankan dengan sudo untuk interface TUN.{W}")
                     return False
+                self._drop_probe_cache_entry(cur_cfg_name)
         return False
 
     def record_ok(self):

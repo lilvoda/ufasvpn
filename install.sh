@@ -26,16 +26,16 @@ if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
     SUDO="sudo"
 fi
 
-if ! command -v python3 >/dev/null 2>&1 || ! python3 -c "import ensurepip" >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1 || ! command -v openvpn >/dev/null 2>&1; then
+if ! command -v python3 >/dev/null 2>&1 || ! python3 -c "import ensurepip" >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1 || ! command -v openvpn >/dev/null 2>&1 || ! command -v ip >/dev/null 2>&1; then
     if [ "$(id -u)" -eq 0 ] || [ -n "$SUDO" ]; then
         if command -v apt-get >/dev/null 2>&1; then
-            echo "[*] Memasang paket dasar apt (python3, venv, pip, curl, openvpn)..."
+            echo "[*] Memasang paket dasar apt (python3, venv, pip, curl, openvpn, iproute2)..."
             $SUDO apt-get update -y
-            $SUDO apt-get install -y python3 python3-venv python3-pip curl ca-certificates openvpn
+            $SUDO apt-get install -y python3 python3-venv python3-pip curl ca-certificates openvpn iproute2
         elif command -v dnf >/dev/null 2>&1; then
-            $SUDO dnf install -y python3 python3-pip curl ca-certificates openvpn
+            $SUDO dnf install -y python3 python3-pip curl ca-certificates openvpn iproute
         elif command -v pacman >/dev/null 2>&1; then
-            $SUDO pacman -S --needed --noconfirm python python-pip curl ca-certificates openvpn
+            $SUDO pacman -S --needed --noconfirm python python-pip curl ca-certificates openvpn iproute2
         fi
     fi
 fi
