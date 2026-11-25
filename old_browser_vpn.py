@@ -4578,11 +4578,149 @@ def _resolve_ovpn_dir_input(raw: str, base_dir: str = BASE) -> str:
     in_base = os.path.join(base_dir, s)
     return in_base if os.path.isdir(in_base) else os.path.abspath(s)
 
+def _detect_vps_hw() -> dict:
+    """Deteksi cepat kapasitas CPU & RAM bebas (memperhitungkan limit cgroup LXC/Docker)."""
+    cpus = float(os.cpu_count() or 2)
+    avail_mb = 2048.0
+    total_mb = 2048.0
+    if os.name == 'nt':
+        try:
+            import ctypes
+            class _MEMSTAT(ctypes.Structure):
+                _fields_ = [
+                    ('dwLength', ctypes.c_ulong), ('dwMemoryLoad', ctypes.c_ulong),
+                    ('ullTotalPhys', ctypes.c_ulonglong), ('ullAvailPhys', ctypes.c_ulonglong),
+                    ('ullTotalPageFile', ctypes.c_ulonglong), ('ullAvailPageFile', ctypes.c_ulonglong),
+                    ('ullTotalVirtual', ctypes.c_ulonglong), ('ullAvailVirtual', ctypes.c_ulonglong),
+                    ('ullAvailExtendedVirtual', ctypes.c_ulonglong),
+                ]
+            ms = _MEMSTAT()
+            ms.dwLength = ctypes.sizeof(ms)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
+                total_mb = ms.ullTotalPhys / 1048576.0
+                avail_mb = ms.ullAvailPhys / 1048576.0
+        except Exception:
+            pass
+    else:
+        try:
+            with open('/proc/meminfo', 'r', encoding='utf-8', errors='ignore') as f:
+                mi = {}
+                for ln in f:
+                    k, _, v = ln.partition(':')
+                    num = v.strip().split()[0] if v.strip() else '0'
+                    if num.isdigit():
+                        mi[k] = int(num) / 1024.0
+                if mi.get('MemTotal'):
+                    total_mb = mi['MemTotal']
+                avail_mb = mi.get('MemAvailable') or (mi.get('MemFree', 0) + mi.get('Buffers', 0) + mi.get('Cached', 0)) or total_mb
+        except Exception:
+            pass
+        # Hormati limit cgroup (Proxmox LXC / Docker) bila lebih kecil dari /proc
+        for c_max_p, c_cur_p in (
+            ('/sys/fs/cgroup/memory.max', '/sys/fs/cgroup/memory.current'),
+            ('/sys/fs/cgroup/memory/memory.limit_in_bytes', '/sys/fs/cgroup/memory/memory.usage_in_bytes'),
+        ):
+            try:
+                if os.path.isfile(c_max_p):
+                    raw_m = open(c_max_p, encoding='ascii').read().strip()
+                    if raw_m.isdigit():
+                        lim_mb = int(raw_m) / 1048576.0
+                        if 64.0 < lim_mb < total_mb * 1.1:
+                            total_mb = min(total_mb, lim_mb)
+                            if os.path.isfile(c_cur_p):
+                                cur_mb = int(open(c_cur_p, encoding='ascii').read().strip()) / 1048576.0
+                                avail_mb = min(avail_mb, max(0.0, lim_mb - cur_mb))
+                    break
+            except Exception:
+                pass
+        try:
+            if os.path.isfile('/sys/fs/cgroup/cpu.max'):
+                parts = open('/sys/fs/cgroup/cpu.max', encoding='ascii').read().strip().split()
+                if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit() and int(parts[1]) > 0:
+                    cpus = min(cpus, max(0.5, int(parts[0]) / int(parts[1])))
+            elif os.path.isfile('/sys/fs/cgroup/cpu/cpu.cfs_quota_us') and os.path.isfile('/sys/fs/cgroup/cpu/cpu.cfs_period_us'):
+                q = int(open('/sys/fs/cgroup/cpu/cpu.cfs_quota_us', encoding='ascii').read().strip())
+                p = int(open('/sys/fs/cgroup/cpu/cpu.cfs_period_us', encoding='ascii').read().strip())
+                if q > 0 and p > 0:
+                    cpus = min(cpus, max(0.5, q / p))
+        except Exception:
+            pass
+    ram_cap = max(1, int(max(0.0, avail_mb - 400.0) / 135.0))
+    cpu_cap = max(2, int(round(cpus * 3.0)))
+    hw_max = max(1, min(24, ram_cap, cpu_cap))
+    if _PLAT['is_android']:
+        hw_max = min(hw_max, 6)
+    return {'cpus': round(cpus, 1), 'total_mb': int(total_mb), 'avail_mb': int(avail_mb), 'hw_max': hw_max}
+
+async def _benchmark_vps_capacity(browser, hw: dict | None = None, choose_two_tab: bool = True) -> tuple[int, bool, str]:
+    """Benchmark singkat Chromium offline (0 kuota/network) untuk menentukan jumlah worker/stream optimal."""
+    hw = hw or _detect_vps_hw()
+    hw_max = max(1, int(hw['hw_max']))
+    if hw_max <= 2 or browser is None:
+        two_t = bool(choose_two_tab and hw['avail_mb'] >= 900 and not _PLAT['is_android'])
+        return hw_max, two_t, (
+            f"Benchmark VPS: {hw['cpus']} vCPU · {hw['avail_mb']/1024:.1f} GB free RAM -> "
+            f"{hw_max} ctx x {2 if two_t else 1} tab ({hw_max * (2 if two_t else 1)} streams)"
+        )
+
+    levels = sorted({v for v in (min(4, hw_max), min(8, hw_max), min(12, hw_max), min(16, hw_max), hw_max) if v >= 1})
+    best_n = levels[0]
+    best_tp = 0.0
+    base_dt = 0.0
+    best_dt = 0.0
+
+    async def _one_probe():
+        c_tmp = None
+        try:
+            c_tmp = await asyncio.wait_for(browser.new_context(), timeout=8.0)
+            p_tmp = await c_tmp.new_page()
+            await asyncio.wait_for(
+                p_tmp.evaluate("() => { let x = 0; for (let i = 0; i < 40000; i++) x = (x + i * 31) & 0xfffffff; return x; }"),
+                timeout=6.0,
+            )
+            await asyncio.sleep(0.35)
+        finally:
+            if c_tmp is not None:
+                try:
+                    await asyncio.wait_for(c_tmp.close(), timeout=4.0)
+                except Exception:
+                    pass
+
+    for n in levels:
+        t0 = time.perf_counter()
+        res = await asyncio.gather(*(_one_probe() for _ in range(n)), return_exceptions=True)
+        dt = max(0.05, time.perf_counter() - t0)
+        ok_cnt = sum(1 for r in res if not isinstance(r, BaseException))
+        if ok_cnt < max(1, int(n * 0.8)):
+            break
+        tp = ok_cnt / dt
+        if base_dt == 0.0:
+            base_dt = dt
+            best_n, best_tp, best_dt = n, tp, dt
+            continue
+        if dt > max(3.5, base_dt * 2.4):
+            break
+        if tp >= best_tp * 1.10:
+            best_n, best_tp, best_dt = n, tp, dt
+        else:
+            break
+        live_ram = _detect_vps_hw()['avail_mb']
+        if live_ram < 320:
+            break
+
+    two_t = bool(choose_two_tab and best_n <= 4 and hw['avail_mb'] >= 900)
+    streams = best_n * (2 if two_t else 1)
+    summary = (
+        f"Benchmark VPS: {hw['cpus']} vCPU · {hw['avail_mb']/1024:.1f} GB free RAM · "
+        f"batch {best_dt:.2f}s -> pilih {best_n} ctx x {2 if two_t else 1} tab ({streams} streams)"
+    )
+    return best_n, two_t, summary
+
 # ── Main Entrypoint ──────────────────────────────────────────────────────────
 async def async_main():
     pa = argparse.ArgumentParser(description='MLBB Fast Checker v9.0 VPN — Cross-Platform (Termux/Linux/Windows)')
     pa.add_argument('combo', nargs='?', default='')
-    pa.add_argument('--workers', type=int, default=0)
+    pa.add_argument('--workers', type=str, default='', help='Jumlah worker (1-30 atau "auto" untuk benchmark VPS)')
     pa.add_argument('--headless', dest='headless', action='store_true', default=None)
     pa.add_argument('--no-headless', dest='headless', action='store_false', default=None)
     pa.add_argument('--debug', action='store_true')
@@ -4683,6 +4821,19 @@ async def async_main():
         sd_t.record_stall('waf', 4.0, now_t=151.0)
         assert not sd_t.should_auto_heal(now_t=145.0)[0]
         assert sd_t.should_auto_heal(now_t=161.0)[0]
+        _hw = _detect_vps_hw()
+        assert _hw['cpus'] > 0 and _hw['total_mb'] > 0 and 1 <= _hw['hw_max'] <= 24
+        class _FakePage:
+            async def evaluate(self, js):
+                await asyncio.sleep(0.01)
+                return 1
+        class _FakeCtx:
+            async def new_page(self): return _FakePage()
+            async def close(self): return None
+        class _FakeBrowser:
+            async def new_context(self): return _FakeCtx()
+        _bw, _b2t, _bmsg = await _benchmark_vps_capacity(_FakeBrowser(), hw={'cpus': 4.0, 'total_mb': 8192, 'avail_mb': 6000, 'hw_max': 12}, choose_two_tab=True)
+        assert 1 <= _bw <= 12 and 'Benchmark VPS:' in _bmsg
         vc.ovpn_files = []
         vc.ovpn_failed = True
         try:
@@ -4695,6 +4846,7 @@ async def async_main():
 
     global DEBUG, HEADLESS, NUM_CONTEXTS, TWO_TAB, PROXY_ENABLED, PROXY_FILE, OUTPUT_DIR, _TUI_ACTIVE, _pw_instance, _driver_pid, _lookup_exec
     TWO_TAB = bool(args.two_tab)
+    auto_two_tab = False
 
     if args.test_ovpn_only:
         ovpn_dir_t = args.vpn_ovpn_dir
@@ -4728,7 +4880,11 @@ async def async_main():
         return
 
     combo_path = ''
+    _w_raw = str(args.workers or '').strip().lower()
+    auto_workers = (_w_raw == 'auto')
+    _w_arg = int(_w_raw) if _w_raw.isdigit() else 0
     workers = 2 if _PLAT['is_android'] else 4
+    hw_info = _detect_vps_hw()
     vpn_cmd = args.vpn_cmd
     vpn_wait = bool(args.vpn_wait)
     waf_cooldown = max(3.0, float(args.waf_cooldown))
@@ -4741,10 +4897,14 @@ async def async_main():
     if args.out:
         OUTPUT_DIR = os.path.abspath(args.out) if os.path.isabs(args.out) else os.path.join(BASE, args.out)
 
-    if args.no_prompt or (args.combo and args.workers > 0):
+    if args.no_prompt or (args.combo and (_w_arg > 0 or auto_workers)):
         combo_path = args.combo or os.path.join(BASE, 'combo.txt')
         default_w = 2 if _PLAT['is_android'] else 4
-        workers = max(1, min(30, args.workers or default_w))
+        if auto_workers:
+            workers = hw_info['hw_max']
+            auto_two_tab = not bool(args.two_tab)
+        else:
+            workers = max(1, min(30, _w_arg or default_w))
         HEADLESS = args.headless if args.headless is not None else True
         DEBUG = args.debug
         if args.proxy_file:
@@ -4800,10 +4960,27 @@ async def async_main():
                     combo_path = cand
                     break
 
-        rec_w = "2" if _PLAT['is_android'] else "4"
-        workers_str = ask(f"Worker threads (1-30, rec {rec_w})", rec_w)
-        workers = max(1, min(30, int(workers_str) if workers_str.isdigit() else int(rec_w)))
-        TWO_TAB = ask_yn("2-tab extra worker? (2 tab/context, lebih cepat)", default='y' if args.two_tab else 'n')
+        _hw_hint = f"{hw_info['cpus']} vCPU · {hw_info['avail_mb']/1024:.1f}GB RAM, cap ~{hw_info['hw_max']}"
+        workers_str = ask(f"Worker threads (1-30 / auto, {_hw_hint})", "auto").strip().lower()
+        if workers_str in ('', 'auto', 'a'):
+            auto_workers = True
+            workers = hw_info['hw_max']
+            _tt_ans = ask("2-tab extra worker? (y/n/auto)", "auto").strip().lower()
+            if _tt_ans in ('y', 'yes'):
+                TWO_TAB = True
+                auto_two_tab = False
+            elif _tt_ans in ('n', 'no'):
+                TWO_TAB = False
+                auto_two_tab = False
+            else:
+                auto_two_tab = True
+        else:
+            auto_workers = False
+            rec_w = 2 if _PLAT['is_android'] else 4
+            workers = max(1, min(30, int(workers_str) if workers_str.isdigit() else rec_w))
+            if workers > hw_info['hw_max']:
+                p_out(f"  {c(GOLD)}[!] Note: {workers} worker > estimasi aman VPS ({hw_info['hw_max']} ctx) — bisa menyebabkan speed drop.{W}")
+            TWO_TAB = ask_yn("2-tab extra worker? (2 tab/context, lebih cepat)", default='y' if args.two_tab else 'n')
         HEADLESS = True if args.headless is None else args.headless
         DEBUG = bool(args.debug)
         PROXY_ENABLED = False
@@ -4898,10 +5075,15 @@ async def async_main():
             f"{vpn_coord.label()} (cmd)" if vpn_cmd else (f"{vpn_coord.label()} (manual-wait)" if vpn_wait else f"{vpn_coord.label()} (cooldown {int(waf_cooldown)}s)")
         )
     )
+    _w_cfg_str = (
+        f"AUTO benchmark (cap {NUM_CONTEXTS} ctx, {'auto' if auto_two_tab else ('2' if TWO_TAB else '1')}-tab)"
+        if auto_workers else
+        f"{NUM_CONTEXTS} ctx x {2 if TWO_TAB else 1} tab ({NUM_CONTEXTS * (2 if TWO_TAB else 1)} streams)"
+    )
     _print_box("CONFIGURATION", [
         f" {c(WHITE)}Platform:{W} {c(CYAN)}{_PLAT['tag']} ({_PLAT['arch']}){W}",
         f" {c(WHITE)}Queue   :{W} {c(GREEN)}{len(queue):,} accounts{W} {c(GRAY)}(tot:{len(combos):,}, done:{len(done_accounts):,}){W}",
-        f" {c(WHITE)}Workers :{W} {c(CYAN)}{NUM_CONTEXTS} ctx x {2 if TWO_TAB else 1} tab ({NUM_CONTEXTS * (2 if TWO_TAB else 1)} streams){W}",
+        f" {c(WHITE)}Workers :{W} {c(CYAN)}{_w_cfg_str}{W}",
         f" {c(WHITE)}Network :{W} {c(GOLD)}{_mode_str}{W}",
         f" {c(WHITE)}Output  :{W} {c(GRAY)}{shortpath(OUTPUT_DIR)}/{W}",
     ], bc=GRAY)
@@ -5004,6 +5186,14 @@ async def async_main():
         _load_static_cache()
         browser_ref[0] = await launch_browser_smart(headless=HEADLESS, humanize=False)
         browser_state['last_relaunch'] = time.monotonic()
+
+        if auto_workers:
+            p_out(f"{c(CYAN)}[*] Menjalankan benchmark kapasitas VPS (auto worker)...{W}")
+            _bw, _b2t, _bmsg = await _benchmark_vps_capacity(browser_ref[0], hw=hw_info, choose_two_tab=auto_two_tab)
+            NUM_CONTEXTS = workers = min(_bw, max(1, len(queue)))
+            if auto_two_tab:
+                TWO_TAB = _b2t
+            p_out(f"{c(GREEN)}[*] {_bmsg} ✓{W}")
 
         # Proxy testing & assignment
         proxy_assignments = [None] * NUM_CONTEXTS
